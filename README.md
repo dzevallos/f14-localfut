@@ -1,4 +1,4 @@
-# FIFA 14 Local FUT — adjusted fork
+# FIFA 14 Local FUT - adjusted fork
 
 A fork of **[KyroGeorge2/FIFA-14-Local-FUT](https://github.com/KyroGeorge2/FIFA-14-Local-FUT)**
 (BETA 2.25.9), with squad, tournament, market and economy work on top. Everything here
