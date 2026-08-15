@@ -12,11 +12,13 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
+from fut_local_settings import load_settings as load_local_settings
 from local_identity import (
     LocalIdentityStore,
     PLAYER_CATALOG,
     PLAYER_BY_ASSET,
     PLAYER_ITEM_TYPE,
+    _diagnostic,
 )
 
 BETA_SCHEMA = "fifa14-local-fut-v2.41.1-beta2.24"
@@ -139,24 +141,81 @@ OFFLINE_SEASON_DIVISIONS = [
 # The retail parser proves `rounds` is an ARRAY. BETA 2.6 uses only keys the
 # exact PC tournament parser handles. A safe-empty fallback remains available
 # with FIFA14_TOURNAMENT_MODE=empty.
+# Local economy tuning. These are deliberate house rules for this offline
+# server, not retail FIFA 14 values.
+#
+# MATCH_RESULT_FLAT_COINS: a completed match pays exactly this, by result. The
+# stat bonuses/penalties and the DNF modifier no longer affect the payout of a
+# completed match at all - they are still computed and returned so the result
+# screen and the logs keep their breakdown. A DNF/abandoned match is not in this
+# table because it never reaches it: _reward_breakdown zeroes both components.
+MATCH_RESULT_FLAT_COINS = {"WIN": 15000, "DRAW": 1000, "LOSS": 750}
+# Advertised per-round coins. Kept equal to the WIN payout so the cup screen
+# never promises a different number from the one the wallet actually receives.
+OFFLINE_TOURNAMENT_ROUND_COINS = MATCH_RESULT_FLAT_COINS["WIN"]
+_R = OFFLINE_TOURNAMENT_ROUND_COINS  # local shorthand for the round tables below
+
+# Round difficulty is the client's own AI ladder index: 0 Beginner, 1 Amateur,
+# 2 Semi-Pro, 3 Professional, 4 World Class, 5 Legendary. Observed in-game: the
+# cup tile shows round 1's level, so the four cups read Amateur / Semi-Pro /
+# Professional / World Class and each one ramps as the bracket goes on. The
+# client clamps to its own MIN_/MAX_DIFFICULTY_LEVEL, so 5 is the assumed
+# ceiling.
+#
+# `prize` is the first-clear award and `repeatPrize` every win after that. Both
+# are set per cup rather than derived from a shared rate: the ladder is meant to
+# climb with the difficulty above it, and each step has its own gap between the
+# first clear and the grind. Per-round coins stay flat at the WIN payout.
 OFFLINE_TOURNAMENTS = [
     {
-        "tournamentId": 1, "name": "Starter Cup", "prize": 500, "repeatPrize": 300, "trophyResourceId": 7100001,
-        "rounds": [(1, 150), (1, 200), (2, 300), (2, 500)],
+        "tournamentId": 1, "name": "Starter Cup", "prize": 50000, "repeatPrize": 25000,
+        "trophyResourceId": 7100001,
+        "rounds": [(1, _R), (1, _R), (2, _R), (2, _R)],
     },
     {
-        "tournamentId": 2, "name": "Bronze Cup", "prize": 750, "repeatPrize": 450, "trophyResourceId": 7100002,
-        "rounds": [(1, 175), (2, 250), (2, 375), (3, 650)],
+        "tournamentId": 2, "name": "Bronze Cup", "prize": 100000, "repeatPrize": 50000,
+        "trophyResourceId": 7100002,
+        "rounds": [(2, _R), (2, _R), (3, _R), (3, _R)],
     },
     {
-        "tournamentId": 3, "name": "Silver Cup", "prize": 1000, "repeatPrize": 600, "trophyResourceId": 7100003,
-        "rounds": [(2, 225), (2, 325), (3, 500), (3, 850)],
+        "tournamentId": 3, "name": "Silver Cup", "prize": 250000, "repeatPrize": 100000,
+        "trophyResourceId": 7100003,
+        "rounds": [(3, _R), (3, _R), (4, _R), (4, _R)],
     },
     {
-        "tournamentId": 4, "name": "Gold Cup", "prize": 1500, "repeatPrize": 900, "trophyResourceId": 7100004,
-        "rounds": [(3, 300), (3, 450), (4, 700), (4, 1200)],
+        "tournamentId": 4, "name": "Gold Cup", "prize": 2500000, "repeatPrize": 750000,
+        "trophyResourceId": 7100004,
+        "rounds": [(4, _R), (5, _R), (5, _R), (5, _R)],
     },
 ]
+# Everything above is the built-in tuning. A user settings file may override the
+# payouts and prizes (tools/fut_settings.py writes it); values are validated and
+# bounded by the loader, and anything it does not mention keeps the value above.
+def _apply_local_settings() -> None:
+    """Overlay the user settings file onto the built-in tuning above."""
+    global OFFLINE_TOURNAMENT_ROUND_COINS, _R
+    settings = load_local_settings()
+    for key, value in (settings.get("matchRewards") or {}).items():
+        MATCH_RESULT_FLAT_COINS[key] = int(value)
+    # Advertised round coins follow the WIN payout, so re-derive after an override.
+    OFFLINE_TOURNAMENT_ROUND_COINS = MATCH_RESULT_FLAT_COINS["WIN"]
+    _R = OFFLINE_TOURNAMENT_ROUND_COINS
+    prizes = settings.get("tournamentPrizes") or {}
+    for tournament in OFFLINE_TOURNAMENTS:
+        tournament["rounds"] = [(difficulty, _R) for difficulty, _ in tournament["rounds"]]
+        override = prizes.get(int(tournament["tournamentId"]))
+        if override:
+            tournament.update({key: int(value) for key, value in override.items()})
+
+
+_apply_local_settings()
+
+# A missing repeatPrize would silently pay 0 for every re-win (the award lookup
+# in _settle_tournament_result_locked defaults to 0), so refuse to import instead.
+for _tournament in OFFLINE_TOURNAMENTS:
+    if int(_tournament.get("prize", 0)) <= 0 or int(_tournament.get("repeatPrize", 0)) <= 0:
+        raise ValueError(f"cup {_tournament.get('name')} is missing a prize/repeatPrize")
+del _tournament
 
 # Verified retail FIFA 14 club IDs from the bundled 10,274-card catalogue.
 # The tournament client asks for count=15 after selecting a 16-team cup; the
@@ -166,6 +225,45 @@ OFFLINE_COMPETITION_TEAM_IDS = (
     241, 243, 21, 69, 10, 11, 9, 22, 5, 73,
     1, 13, 18, 2, 7,
 )
+
+# Per-cup AI opponents. CardsDLLzf.dll builds this request as
+# `/teams?groupId=%d&count=%d`, and the groupId it sends is the `aigroup` member
+# of the tournament record -- so retail already had one pool per cup and we were
+# serving the same fifteen European giants to all four. A bronze starter club
+# was drawing Barcelona in the Starter Cup first round.
+#
+# Every id below is in the client's own shipped kit *and* badge sets (587 clubs
+# extracted from cards0.big by tools/scan, see fifa14-match-assets), so each one
+# renders with a real crest, and each has >= 16 players in PLAYER_CATALOG, which
+# is what the strength figures are computed from: the mean rating of a club's
+# best eighteen. The ladder runs ~60 / ~67 / ~74 / ~81 against a bronze starter
+# squad that rates about 60.
+TOURNAMENT_TEAM_POOLS = {
+    # Starter Cup, mean 60.2 (59.1-61.9): lower-league sides. Anchors: 1934
+    # (Nile Ranger 65), 1936 (Jamie Cureton 65), 81 (Liam Craig 67).
+    1: (
+        1920, 1954, 1930, 1480, 127, 1934, 1936, 1754,
+        361, 81, 1945, 1928, 110890, 1802, 1924,
+    ),
+    # Bronze Cup, mean 66.7 (65.2-68.1): second-tier and smaller top-flight.
+    # Anchors: 3 (Jordan Rhodes 73), 8 (Ross McCormack 73), 1903 (Toornstra 74).
+    2: (
+        94, 1932, 1943, 1939, 1926, 88, 62, 110,
+        1902, 3, 97, 8, 1913, 1903, 91,
+    ),
+    # Silver Cup, mean 74.4 (72.7-76.3): established top-flight.
+    # Anchors: 144 (Berbatov 82), 28 (van der Vaart 83), 50 (Cassano 81).
+    3: (
+        2, 19, 17, 109, 106, 1792, 1806, 1960,
+        144, 15, 66, 65, 28, 50, 573,
+    ),
+    # Gold Cup, mean 81.2 (78.3-84.1): the elite that used to fill every cup.
+    # Anchors: 241 (Messi 94), 243 (Ronaldo 92), 21 (Ribéry 90).
+    4: (
+        241, 21, 10, 243, 5, 11, 45, 22,
+        73, 1, 18, 240, 9, 44, 47,
+    ),
+}
 
 
 def _season_matches(division: int, match_count: int) -> list[dict[str, Any]]:
@@ -187,7 +285,27 @@ def _season_matches(division: int, match_count: int) -> list[dict[str, Any]]:
 
 
 def _coin_award(value: int) -> dict[str, Any]:
-    return {"type": "coin", "value": int(value), "assetId": 0, "count": 1, "halId": 0, "teamId": 0}
+    """One coin award inside a season prizeSet.
+
+    BETA 2.3 recorded the Offline Seasons screen asking for `/fut/items/pc/0.json`
+    once per division right after parsing season/list, then abandoning the screen
+    before season/user was ever consumed -- which is exactly the "Seasons kicks me
+    back to the FUT menu" symptom. The award below is the reason it asks: it
+    declares `assetId: 0`, so the client dutifully tries to resolve award item 0
+    and gives up when the sentinel resolves to nothing.
+
+    The cup ladder does not have this problem, and its awards are a different
+    shape: `{"awardType": 1, "value": N, "halid": 0}` -- an award *type* enum and
+    no asset to look up (see the tournament record's awardSet). That shape is
+    proven in-game: cups render, pay out and settle. So seasons now use it too.
+
+    This is a hypothesis with a named test, not a confirmed fix: no capture of a
+    Seasons attempt exists on this build. `FIFA14_SEASON_AWARD_MODE=legacy`
+    restores the assetId form for an A/B in one sitting.
+    """
+    if os.environ.get("FIFA14_SEASON_AWARD_MODE", "native").strip().lower() == "legacy":
+        return {"type": "coin", "value": int(value), "assetId": 0, "count": 1, "halId": 0, "teamId": 0}
+    return {"awardType": 1, "value": int(value), "halid": 0}
 
 
 def _season_prize(prize_level: str, threshold: int, coin_value: int = 0) -> dict[str, Any]:
@@ -261,7 +379,9 @@ def _native_tournament_record(definition: dict[str, Any]) -> dict[str, Any]:
         "id": tournament_id,
         "type": "offline",
         "treeType": "knockout",
-        "aigroup": 0,
+        # The client echoes this back as `groupId` on /tournament/teams, which is
+        # how each cup gets its own opponents (TOURNAMENT_TEAM_POOLS).
+        "aigroup": int(definition.get("aigroup", tournament_id) or 0),
         "eligibilityOperation": "AND",
         "elgReq": [],
         "numTeams": 16,
@@ -1288,15 +1408,88 @@ class BetaIdentityStore(LocalIdentityStore):
             self._daily_counter_add_locked(connection, "new_accounts", 1)
             return self.beta_profile_summary(connection=connection)
 
-    def ensure_consumables_beta_test_balance(self, target_coins: int = 100_000_000) -> dict[str, Any]:
-        """Grant an established BETA club a one-time consumables test float.
+    def reset_club_to_starter(self) -> dict[str, Any]:
+        """Wipe the club back to the provisioned starter squad.
+
+        Deliberately reuses the fresh-profile branch of ensure_beta_starter_club()
+        rather than rebuilding a squad here: that branch is the one the verifiers
+        exercise, so a reset club is identical to a first-run club instead of
+        being a second, subtly different definition of "starter".
+
+        Kept: the persona/identity, the wallet, and match history. Removed: every
+        owned card, every squad, packs, market listings and cup progress -- all
+        the things that refer to cards that will no longer exist.
+        """
+        with self._lock, closing(self._connect()) as connection, connection:
+            persona_id = int(self._identity(connection)["persona_id"])
+            before = connection.execute(
+                "SELECT COUNT(*) FROM items WHERE persona_id=?", (persona_id,)
+            ).fetchone()[0]
+            # The fresh-profile path provisions a zero-coin club. Clearing the
+            # club and setting a balance are separate decisions, so carry the
+            # wallet across instead of silently emptying it.
+            wallet = connection.execute(
+                "SELECT coins, fifa_points FROM clubs WHERE persona_id=?", (persona_id,)
+            ).fetchone()
+            kept_coins = int(wallet["coins"]) if wallet is not None else 0
+            kept_points = int(wallet["fifa_points"]) if wallet is not None else 0
+            for statement, parameters in (
+                ("DELETE FROM pack_contents", ()),
+                ("DELETE FROM packs WHERE persona_id=?", (persona_id,)),
+                ("DELETE FROM squad_players", ()),
+                ("DELETE FROM squads WHERE persona_id=?", (persona_id,)),
+                ("DELETE FROM items WHERE persona_id=?", (persona_id,)),
+                ("DELETE FROM market_listings WHERE persona_id=?", (persona_id,)),
+                ("DELETE FROM market_synthetic_sales", ()),
+                ("DELETE FROM beta_tournament_progress WHERE persona_id=?", (persona_id,)),
+                ("UPDATE beta_offline_tournaments SET current_round=0, won=0 WHERE persona_id=?", (persona_id,)),
+                # Dropping the club row is what makes ensure_beta_starter_club()
+                # take its fresh-profile path below.
+                ("DELETE FROM clubs WHERE persona_id=?", (persona_id,)),
+                # Every marker that gates re-provisioning has to go, or the
+                # thing it guards is not rebuilt: the cosmetic seeder returns
+                # early on its catalogue signature and the club would come back
+                # with 23 players and no kits, stadium or badge.
+                ("DELETE FROM schema_meta WHERE meta_key IN "
+                 "('beta_starter_provisioned','beta222_persistent_club_guard',"
+                 "'beta222_cosmetic_catalog_signature')", ()),
+            ):
+                connection.execute(statement, parameters)
+        self.ensure_beta_starter_club()
+        with self._lock, closing(self._connect()) as connection, connection:
+            connection.execute(
+                "UPDATE clubs SET coins=?, fifa_points=? WHERE persona_id=?",
+                (kept_coins, kept_points, persona_id),
+            )
+        summary = self.beta_profile_summary()
+        _diagnostic(
+            f"club reset to the starter squad: {before} owned item(s) removed, "
+            f"{summary.get('ownedItems')} provisioned, wallet kept at {kept_coins}"
+        )
+        return summary
+
+    def ensure_consumables_beta_test_balance(self, target_coins: int = 1_000_000) -> dict[str, Any]:
+        """Top an established BETA club up to a test float and record the grant.
 
         BETA 2.24 intentionally retained the progression branch's zero-coin start,
         which made the new pack/consumable flow impossible to test for an existing
-        club with no match earnings.  2.24.2 tops the current club up to 100,000,000
-        coins once, records the grant in the wallet ledger, and then leaves the
-        balance entirely under normal pack/match economy control.  The fixed
-        reference id makes this idempotent across launches and extracted builds.
+        club with no match earnings, so 2.24.2 granted a float once and keyed it on
+        a fixed build reference. That made it a single shot for the lifetime of the
+        save: once the ledger row existed the tool silently did nothing, which is
+        how it "stopped working" after the balance was later spent or reset.
+
+        BETA 2.26.0 makes it a top-up to `target_coins` instead. Running it while
+        the balance is already at or above the target is still a no-op, so it can
+        never inflate a club past the float, but a club that has spent below the
+        target can be restored for the next test round. Every top-up gets its own
+        ledger row so the history stays readable.
+
+        This is safe to make repeatable *because the launcher never asks for it*:
+        run_fifa14_local_beta.ps1 calls prepare_fifa14_beta_state.py without
+        --test-coins, so only a deliberate tools/give_test_coins.ps1 run grants
+        anything. Do not wire this into startup -- topping up on every launch is
+        exactly the bug ensure_local_test_balance() was written to stop, where
+        pack charges silently reappeared after restarting the game.
         """
         target = max(0, int(target_coins))
         with self._lock, closing(self._connect()) as connection, connection:
@@ -1308,42 +1501,39 @@ class BetaIdentityStore(LocalIdentityStore):
             if club is None:
                 return {"granted": 0, "balanceBefore": 0, "balanceAfter": 0, "idempotent": True}
             before = int(club["coins"])
-            existing = connection.execute(
-                """
-                SELECT transaction_id,amount,balance_before,balance_after
-                FROM wallet_transactions
-                WHERE persona_id=? AND currency='COINS' AND reason='BETA_CONSUMABLES_TEST_GRANT'
-                  AND reference_type='BUILD' AND reference_id='2.41.1-beta2.24.2'
-                """,
-                (persona_id,),
-            ).fetchone()
-            if existing is not None:
-                current = int(connection.execute(
-                    "SELECT coins FROM clubs WHERE persona_id=?", (persona_id,)
-                ).fetchone()["coins"])
-                return {
-                    "transactionId": int(existing["transaction_id"]),
-                    "granted": 0,
-                    "balanceBefore": current,
-                    "balanceAfter": current,
-                    "idempotent": True,
-                }
             grant = max(0, target - before)
             if grant <= 0:
-                return {"granted": 0, "balanceBefore": before, "balanceAfter": before, "idempotent": True}
+                return {
+                    "granted": 0, "balanceBefore": before, "balanceAfter": before,
+                    "targetCoins": target, "idempotent": True,
+                }
+            # The reference has to be unique per top-up: _wallet_write_locked
+            # treats a repeated (reason, type, reference) as already-applied and
+            # returns the old row *reporting success* without moving the balance.
+            # A timestamp alone is not enough -- two top-ups inside one second
+            # collide -- so the starting balance is part of the key, and any real
+            # top-up changes it. The already-at-target check above is what makes
+            # this safe to re-run.
             tx = self._wallet_write_locked(
                 connection,
                 amount=grant,
                 reason="BETA_CONSUMABLES_TEST_GRANT",
-                reference_type="BUILD",
-                reference_id="2.41.1-beta2.24.2",
+                reference_type="TEST_FLOAT",
+                reference_id=f"top-up-{target}-from-{before}-{int(time.time())}",
                 metadata={"purpose": "consumables-pack-testing", "targetCoins": target},
             )
+            if tx.get("idempotent"):
+                # Never report a grant that did not happen.
+                raise ValueError(
+                    f"test-float top-up collided with wallet transaction {tx['transactionId']}; "
+                    "balance was not changed"
+                )
             return {
                 "transactionId": int(tx["transactionId"]),
                 "granted": grant,
                 "balanceBefore": before,
                 "balanceAfter": int(tx["balanceAfter"]),
+                "targetCoins": target,
                 "idempotent": False,
             }
 
@@ -1568,7 +1758,7 @@ class BetaIdentityStore(LocalIdentityStore):
                  now, now, json.dumps(document, separators=(",", ":"), sort_keys=True)),
             )
             self._counter_add_locked(connection, "matches_started", 1)
-        squad = self.active_squad_document()
+        squad = self.playable_squad_document()
         if isinstance(squad, dict):
             squad["actives"] = self.active_cosmetic_items(include_badge=False)
         return {"squad": squad, "startDateTime": int(time.time())}
@@ -1734,7 +1924,25 @@ class BetaIdentityStore(LocalIdentityStore):
         applied_dnf = min(1.0, max(0.0, float(dnf_modifier)))
         skill = int(round(skill_raw * applied_dnf * multiplier)) if not dnf else 0
         total = max(0, completion + skill)
+        # House rule: a completed match pays a flat amount decided only by the
+        # result. The stat breakdown above is still returned for the result
+        # screen and diagnostics, but it no longer decides the payout and the
+        # DNF modifier cannot reduce it. An abandoned match still pays zero.
+        flat_result = ""
+        if completed and not dnf:
+            flat_result = "WIN" if goals > goals_against else "LOSS" if goals < goals_against else "DRAW"
+            completion = int(MATCH_RESULT_FLAT_COINS.get(flat_result, 0))
+            skill = 0
+            total = completion
+        elif dnf:
+            # An abandoned match pays whatever DNF is configured -- 0 by default,
+            # which is the long-standing house rule.
+            flat_result = "DNF"
+            completion = int(MATCH_RESULT_FLAT_COINS.get("DNF", 0))
+            skill = 0
+            total = completion
         return {
+            "flatResultAward": flat_result or None,
             "minutesPlayed": minutes,
             "completed": bool(completed and not dnf),
             "dnf": dnf,
@@ -2470,15 +2678,23 @@ class BetaIdentityStore(LocalIdentityStore):
         # the list parser does not consume a `name` member.
         return {"tournament": [_native_tournament_record(row) for row in OFFLINE_TOURNAMENTS]}
 
-    def offline_tournament_teams(self, count: int = 15) -> dict[str, Any]:
+    def offline_tournament_teams(self, count: int = 15, group_id: Any = None) -> dict[str, Any]:
         """Return the exact FutGetTournamentTeams response shape.
 
         The retail response parser special-cases only `teamId` and requires it
         to be an array.  Returning the tournament catalogue here caused the
         BETA 2.6 deep-selection crash immediately after this request.
+
+        `group_id` is the `groupId` query member, which the client copies from
+        the cup's `aigroup`; it selects that cup's opponents. An unknown group
+        falls back to the shared pool rather than fielding an empty bracket.
         """
-        safe_count = max(0, min(int(count), len(OFFLINE_COMPETITION_TEAM_IDS)))
-        return {"teamId": [int(team_id) for team_id in OFFLINE_COMPETITION_TEAM_IDS[:safe_count]]}
+        try:
+            pool = TOURNAMENT_TEAM_POOLS.get(int(group_id), OFFLINE_COMPETITION_TEAM_IDS)
+        except (TypeError, ValueError):
+            pool = OFFLINE_COMPETITION_TEAM_IDS
+        safe_count = max(0, min(int(count), len(pool)))
+        return {"teamId": [int(team_id) for team_id in pool[:safe_count]]}
 
     @staticmethod
     def _tournament_progress_is_resumable(round_value: int, tournament_data: str, progress_data: str) -> bool:
@@ -2488,7 +2704,22 @@ class BetaIdentityStore(LocalIdentityStore):
         progressData is four zero bytes (``AAAAAA==``). That state is not a
         playable saved bracket and crashes when reopened. Only later rounds or
         non-zero opaque progress bytes are advertised as resumable.
+
+        BETA 2.26.0: a later round is not enough on its own. Winning a non-final
+        round stores `round_value + 1` with an intentionally blank tournamentData
+        and waits for the client to PUT its own bracket; if the client never comes
+        back -- it was kicked out of the Gold Cup mid-run on 2026-08-15 -- the save
+        keeps round 2 with no bracket at all. That state was still advertised as
+        Underway, and opening it killed the client: with tournamentData empty the
+        release adapter stops reshaping the response, so the six-member raw record
+        goes out in the wrong member order, `dataVersion` decodes whatever buffer
+        precedes it instead of the bracket, and the length it reads there is the
+        ASCII "27.0" out of a 127.0.0.1 URL string -- an 808,335,154-byte EASTL
+        vector, "Out of memory ... Stopping..", MemoryExhausted.xml. A round we
+        have no bracket for is not resumable at any round number.
         """
+        if not str(tournament_data or "").strip():
+            return False
         if int(round_value) > 1:
             return True
         raw = str(progress_data or "").strip()

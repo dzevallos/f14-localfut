@@ -54,6 +54,60 @@ const FIFA_NAV_TARGETS = [
   {name:'NAV::sendScreenEvent', rva:0x006b54a0, signature:[0x55,0x8b,0xec,0x8b,0x45,0x10,0x85,0xc0,0x74,0x23,0x80,0x38]},
   {name:'NAV::sendAction', rva:0x006fda50, signature:[0x55,0x8b,0xec,0x51,0x53,0x56,0x57,0xc7,0x45,0xfc,0xff,0xff,0xff,0xff]}
 ];
+// BETA 2.25.9 diagnostic: the offline match loader faults deterministically at
+// fifa14.exe+0x1300840 while walking a fixed 22-entry pointer table found at
+// [[this+0x348b0]+0x34]. Element 21 reads back as 0xcdcdcdcd - CRT heap that was
+// allocated but never written. The loop already null-checks each entry, so a
+// NULL would be skipped harmlessly; only the debug fill pattern kills it. Four
+// crash dumps agree on the index while every heap address differs, so some
+// producer reliably fills 21 of 22 slots. Log the table at function entry,
+// before the loop runs, so the next crash reports what it is walking.
+// BETA 2.25.9 diagnostic: fifa14.exe's assert reporter. Resuming a round-2 cup
+// reaches it and ends at its `int 3`, which is why the crash surfaces as
+// STATUS_BREAKPOINT with no message. The function takes one record pointer:
+//
+//   if ([global+0x23cb4] != 0) -> call the registered handler, return
+//   else  push record->[+0], record->[+4], record->[+8] and a format string,
+//         call the log function three times, then int 3
+//
+// Those three fields are the assertion's own text. Read them here, before the
+// break, so the crash reports what FIFA actually objected to instead of an
+// opaque breakpoint. Purely observational: the record is only read.
+const ASSERT_REPORTER_TARGET = {
+  name: 'fifa14 assert reporter',
+  rva: 0x01942300,
+  signature: [0x55,0x8b,0xec,0x68,0x08,0x5d,0xb0,0x04,0xff,0x15,0xb8,0xa3,0xc2,0x03,
+              0xa1,0x00,0x5d,0xb0,0x04,0x83,0xb8,0xb4,0x3c,0x02],
+  fieldOffsets: [0x00, 0x04, 0x08]
+};
+// BETA 2.25.9 diagnostic: resuming a round-2 offline cup faults with a null
+// virtual call at CardsDLLzf.dll+0xc90b9. The enclosing function is a lookup:
+//
+//   count = ([this+0x98] - [this+0x94]) / 4
+//   for i in 0..count-1: if (entry[i]->[+4] == arg0) -> found
+//   not found -> local = NULL ... then  mov edx,[ecx]  on that NULL
+//
+// So the crash is a failed lookup whose miss path dereferences the null it just
+// stored. Log the key being requested and every key actually registered, so the
+// next resume attempt names what the client wanted and could not find.
+const CUP_RESUME_LOOKUP_TARGET = {
+  name: 'offline cup resume registry lookup',
+  rva: 0x000c9040,
+  signature: [0x55,0x8b,0xec,0x51,0x53,0x56,0x57,0x8b,0xf9,
+              0x8b,0x87,0x98,0x00,0x00,0x00,0x2b,0x87,0x94,0x00,0x00,0x00],
+  beginOffset: 0x94,
+  endOffset: 0x98,
+  keyOffset: 0x04,
+  maxEntries: 64
+};
+const MATCH_ENTITY_TABLE_TARGET = {
+  name: 'offline match entity table walk',
+  rva: 0x013007e0,
+  signature: [0x55,0x8b,0xec,0x83,0xec,0x08,0x53,0x56,0x57,0x8d,0x45,0xf8,0x8b,0xf9,0x8b,0x77,0x5c],
+  contextOffset: 0x348b0,
+  arrayOffset: 0x34,
+  entryCount: 22
+};
 const REMOTE_REDIRECTOR_PORT = 42127;
 const LOCAL_REDIRECTOR_PORT = 42129;
 const REDIRECT_PORTS = new Set([REMOTE_REDIRECTOR_PORT, 44125, 8099]);
@@ -356,6 +410,16 @@ let competitionTraceKind = '';
 let competitionTraceGeneration = 0;
 let competitionTraceLastHttpKey = '';
 let competitionTraceLastHttpMs = 0;
+let competitionKeyCount = 0;
+let competitionWindowStartMs = 0;
+// Gameplay transitions: observing one closes the heavy JSON-key trace instead of
+// opening it. Both are followed by very large parses on a latency-sensitive path.
+const HEAVY_TRACE_FORBIDDEN_KINDS = new Set(['match-create-or-result', 'match-end']);
+// Kinds traced for key names only. The 32-frame ACCURATE backtrace is what makes
+// the key hook expensive (~7 ms/key); the store offer document is ~37 KB across
+// three arrays, so tracing it with backtraces would stall the Store the same way
+// it stalled match creation. Key names alone answer what the offer parser reads.
+const CHEAP_TRACE_KINDS = new Set(['store-purchasegroup']);
 let competitionOperationIndexes = Object.create(null);
 let navSendActionFunction = null;
 // BETA 2.23: an offline DestroyMatch can complete successfully while the retail
@@ -368,38 +432,84 @@ let navSendActionFunction = null;
 let postMatchReturnGuardUntilMs = 0;
 let postMatchReturnGuardGeneration = 0;
 let postMatchReturnGuardLastArmMs = 0;
+let postMatchReturnGuardArmedMs = 0;
+let postMatchReturnGuardFromMatchEnd = false;
 let postMatchFccLogoutRedirects = 0;
+let postMatchFccLogoutPassthroughs = 0;
 const POST_MATCH_RETURN_GUARD_MS = 45000;
 const ACTIVE_MATCH_RETURN_GUARD_MS = 45 * 60 * 1000;
+// BETA 2.26.0: the CreateMatch pre-arm below covers a completed match whose
+// DestroyMatch we never see, but it also covers the whole *setup* phase, where a
+// logout means the client gave up before kickoff. The 2026-08-14 capture caught
+// exactly that: fcc_logout 2.5 s after MatchReady, zero /match/end requests, and
+// the redirect sent a tearing-down client to GameHub -- the "Leaving Ultimate
+// Team" hang. No real match, forfeit included, reaches its logout this fast, so
+// a pre-armed guard stays out of the way until a match could plausibly have been
+// played. A guard armed by an observed /match/end is exempt: that one is proof.
+const PRE_ARM_MIN_ELAPSED_MS = 90000;
 const postMatchStayInFutView = Memory.allocUtf8String('external/ion_fut/screens/gameHub/GameHub');
 const authenticatedIcebreakerAction = Memory.allocUtf8String('iceBreaker');
 const authenticatedIcebreakerEmptyParameter = Memory.allocUtf8String('');
 
 function nowMs() { return Date.now(); }
 function postMatchReturnGuardActive() { return postMatchReturnGuardUntilMs > nowMs(); }
-function armPostMatchReturnGuard(source, durationMs) {
+function armPostMatchReturnGuard(source, durationMs, fromMatchEnd) {
   const currentMs = nowMs();
   const windowMs = Math.max(1000, Number(durationMs || POST_MATCH_RETURN_GUARD_MS));
   // send and WSASend may both expose the same request. Do not create two guard
   // generations for one packet; simply keep/extend the existing window.
   if (postMatchReturnGuardActive() && (currentMs - postMatchReturnGuardLastArmMs) < 1000) {
     postMatchReturnGuardUntilMs = Math.max(postMatchReturnGuardUntilMs, currentMs + windowMs);
+    postMatchReturnGuardFromMatchEnd = postMatchReturnGuardFromMatchEnd || !!fromMatchEnd;
     return;
   }
   postMatchReturnGuardGeneration += 1;
   postMatchReturnGuardLastArmMs = currentMs;
   postMatchReturnGuardUntilMs = currentMs + windowMs;
+  // MatchReady re-arms while a match is being set up. Keep the age of the
+  // *first* arm of this match so the pre-arm floor measures the whole setup,
+  // not the last packet before the client bailed.
+  if (!postMatchReturnGuardArmedMs || (currentMs - postMatchReturnGuardArmedMs) > ACTIVE_MATCH_RETURN_GUARD_MS) {
+    postMatchReturnGuardArmedMs = currentMs;
+  }
+  if (fromMatchEnd) postMatchReturnGuardFromMatchEnd = true;
   emit('fifa-postmatch-return-guard-armed-beta223', {
     generation:postMatchReturnGuardGeneration, source:String(source || 'socket'),
-    window_ms:windowMs, until_ms:postMatchReturnGuardUntilMs, thread_id:tid()
+    window_ms:windowMs, until_ms:postMatchReturnGuardUntilMs,
+    from_match_end:postMatchReturnGuardFromMatchEnd,
+    armed_age_ms:currentMs - postMatchReturnGuardArmedMs, thread_id:tid()
   });
 }
 function competitionTraceActive() { return competitionTraceUntilMs > nowMs(); }
+// emit()'s 1000-event cap only stops the send. Anything that pays for a
+// backtrace before emitting has to check the budget itself or it keeps paying
+// full price for data that is discarded.
+function emitBudgetLeft(kind) { return (counters[kind] || 0) < 1000; }
+// Per-window accounting so a stalled frontend can be measured instead of
+// inferred: how many JSON keys the hook actually processed, and for how long.
+function flushCompetitionTraceCost(reason) {
+  if (competitionWindowStartMs === 0) return;
+  emit('cards-competition-trace-cost-beta2259', {
+    kind: competitionTraceKind, generation: competitionTraceGeneration, reason: reason,
+    keys_traced: competitionKeyCount,
+    window_open_ms: Math.round(nowMs() - competitionWindowStartMs),
+    emit_budget_spent: !emitBudgetLeft('cards-competition-json-key')
+  });
+  competitionWindowStartMs = 0;
+  competitionKeyCount = 0;
+}
 function armCompetitionTrace(kind, reason, durationMs) {
+  flushCompetitionTraceCost('re-armed');
   competitionTraceGeneration += 1;
   competitionTraceKind = kind || 'competition';
   const windowMs = Math.max(1000, durationMs || 15000);
   competitionTraceUntilMs = nowMs() + windowMs;
+  competitionWindowStartMs = nowMs();
+  competitionKeyCount = 0;
+  const generation = competitionTraceGeneration;
+  setTimeout(function () {
+    if (competitionTraceGeneration === generation) flushCompetitionTraceCost('window expired');
+  }, windowMs + 50);
   emit('cards-competition-trace-armed', {
     kind: competitionTraceKind, reason: reason, generation: competitionTraceGeneration,
     window_ms: windowMs, until_ms: competitionTraceUntilMs, thread_id: tid()
@@ -411,12 +521,13 @@ function noteCompetitionHttpRequest(text, source) {
   let kind = '';
   if (lowered.indexOf('/ut/game/fifa14/match/end') >= 0) {
     kind = 'match-end';
-    armPostMatchReturnGuard(source, POST_MATCH_RETURN_GUARD_MS);
+    armPostMatchReturnGuard(source, POST_MATCH_RETURN_GUARD_MS, true);
   }
   else if (lowered.indexOf(' /ut/game/fifa14/season/list') >= 0) kind = 'season-list';
   else if (lowered.indexOf(' /ut/game/fifa14/season/user') >= 0) kind = 'season-user';
   else if (lowered.indexOf(' /ut/game/fifa14/tournament/list') >= 0) kind = 'tournament-list';
   else if (lowered.indexOf(' /ut/game/fifa14/tournament/teams') >= 0) kind = 'tournament-teams';
+  else if (lowered.indexOf(' /ut/game/fifa14/store/purchasegroup') >= 0) kind = 'store-purchasegroup';
   else if (lowered.indexOf(' /ut/game/fifa14/tournament/user/list') >= 0) kind = 'tournament-user-list';
   else if (lowered.indexOf(' /ut/game/fifa14/tournament/user/') >= 0) kind = 'tournament-user-update';
   else if (lowered.indexOf(' /ut/game/fifa14/match') >= 0 && lowered.indexOf('/match/reset') < 0) {
@@ -425,9 +536,36 @@ function noteCompetitionHttpRequest(text, source) {
     // our send/WSASend hook does not observe after gameplay. Pre-arm the one-shot
     // return repair when CreateMatch is observed and keep it valid for a normal
     // match duration. This still only rewrites the first fcc_logout view.
-    armPostMatchReturnGuard(String(source || 'socket') + ':active-match', ACTIVE_MATCH_RETURN_GUARD_MS);
+    armPostMatchReturnGuard(String(source || 'socket') + ':active-match', ACTIVE_MATCH_RETURN_GUARD_MS, false);
   }
   if (!kind) return;
+  // BETA 2.25.9 hotfix: never arm the unrestricted parser-scoped JSON-key trace
+  // across a gameplay transition. The key-mapper hook costs roughly 7 ms per key
+  // (cstring + a 32-frame ACCURATE backtrace), and both transitions parse very
+  // large documents: CreateMatch returns the full ~30 KB SquadDetails with 23
+  // ItemData records, and /match/end is immediately followed by the FUT frontend
+  // rebuilding itself. Either stalls the parsing thread long enough for FIFA's
+  // Blaze keepalive to expire, after which the client reports that the Origin
+  // services are unavailable and hangs on "Leaving Ultimate Team" logging out of
+  // a session it has already torn down. This trace exists for the small
+  // season/tournament documents; keep it armed only for those.
+  //
+  // Skipping the arm is not enough on its own: neighbouring tournament requests
+  // (tournament/teams, tournament/user/<id>) open their own 15 s windows and the
+  // transition lands inside one of them. Close any window still open.
+  if (HEAVY_TRACE_FORBIDDEN_KINDS.has(kind)) {
+    if (competitionTraceActive()) {
+      emit('cards-competition-trace-disarmed-on-transition-beta2259', {
+        transition: kind, previous_kind: competitionTraceKind,
+        generation: competitionTraceGeneration,
+        remaining_ms: competitionTraceUntilMs - nowMs(), thread_id: tid()
+      });
+    }
+    competitionTraceUntilMs = 0;
+    competitionTraceLastHttpKey = '';
+    flushCompetitionTraceCost('disarmed on ' + kind);
+    return;
+  }
   const currentMs = nowMs();
   // send/WSASend can expose the same request through more than one layer. Do
   // not churn generations for a duplicate observation in the same second.
@@ -1046,6 +1184,27 @@ function hookHostByName() {
     const node = cstring(args[0], 512);
     noteDynamicFallbackDns(node);
     emit('trusted-console-dns', {export: 'gethostbyname', node: node, thread_id: tid()});
+  }});
+}
+// BETA 2.26.0: fifa14.exe reports its own state through OutputDebugString. Those
+// calls already reach us as DBG_PRINTEXCEPTION_C (0x40010006) system exceptions -
+// 40 of them in the 2026-08-14 capture, nine landing exactly on the MatchReady
+// that preceded the Origin-services error - but the exception record does not
+// carry the text, so the client's own account of the failure was thrown away.
+// Read it at the source. This is strings only: no backtrace, no memory probe, so
+// it costs a fraction of the JSON-key hook that stalled BETA 2.25.9 (rule 4), and
+// emit()'s per-kind cap bounds it if a match floods the channel.
+function hookDebugOutput(name, wide) {
+  const address = Module.findGlobalExportByName(name);
+  if (address === null) { emit('fifa-debug-string-hook-missing-beta2260', {export: name}); return; }
+  Interceptor.attach(address, {onEnter(args) {
+    if (!emitBudgetLeft('fifa-debug-string-beta2260')) return;
+    let text = null;
+    try { text = wide ? utf16(args[0], 512) : cstring(args[0], 512); } catch (_) { return; }
+    if (text === null || text === undefined) return;
+    text = String(text).replace(/[\r\n]+$/, '');
+    if (!text.length) return;
+    emit('fifa-debug-string-beta2260', {export: name, text: text, thread_id: tid()});
   }});
 }
 function hookSend() {
@@ -3183,6 +3342,8 @@ function attachCardsHooksOnce(reason) {
     }
   });
 
+  installCupResumeLookupDiagnostic(module);
+
   installCardsHook(module, byName['JSON key mapper'], {
     onEnter(args) {
       const key = String(tid());
@@ -3191,17 +3352,33 @@ function attachCardsHooksOnce(reason) {
       this.icebreakerPackListActive = (icebreakerPackListParserDepthByThread[key] || 0) > 0;
       this.icebreakerPackEntryActive = (icebreakerPackEntryParserDepthByThread[key] || 0) > 0;
       this.competitionActive = competitionTraceActive();
+      if (this.competitionActive) competitionKeyCount += 1;
       this.active = this.operation92Active || this.getUserInfoActive || this.icebreakerPackListActive || this.icebreakerPackEntryActive || this.competitionActive;
-      if (this.active) {
+      // Only pay for the key name and the 32-frame ACCURATE backtrace while some
+      // active trace can still emit. emit()'s 1000-event cap suppresses the send
+      // but not this work, so without the budget check the hook kept stalling the
+      // parsing thread long after it had stopped producing any data.
+      this.recordable = this.active && (
+        (this.operation92Active && emitBudgetLeft('cards-operation92-json-key')) ||
+        (this.getUserInfoActive && emitBudgetLeft('cards-get-user-info-json-key')) ||
+        ((this.icebreakerPackListActive || this.icebreakerPackEntryActive)
+          && emitBudgetLeft('cards-icebreaker-packlist-json-key')) ||
+        (this.competitionActive && emitBudgetLeft('cards-competition-json-key'))
+      );
+      if (this.recordable) {
         this.keyName = cstring(args[0], 256);
-        this.mapperReturnAddress = safePtr(this.returnAddress);
-        this.mapperBacktrace = normalizedBacktrace(this.context);
         this.competitionKind = competitionTraceKind;
         this.competitionGeneration = competitionTraceGeneration;
+        // Cheap kinds record the key name only; see CHEAP_TRACE_KINDS.
+        this.cheapTrace = this.competitionActive && CHEAP_TRACE_KINDS.has(competitionTraceKind);
+        if (!this.cheapTrace) {
+          this.mapperReturnAddress = safePtr(this.returnAddress);
+          this.mapperBacktrace = normalizedBacktrace(this.context);
+        }
       }
     },
     onLeave(retval) {
-      if (!this.active) return;
+      if (!this.recordable) return;
       const payload = {thread_id: tid(), key: this.keyName, id: retval.toUInt32(), id_hex: '0x' + retval.toUInt32().toString(16)};
       if (this.operation92Active) emit('cards-operation92-json-key', payload);
       if (this.getUserInfoActive) emit('cards-get-user-info-json-key', payload);
@@ -3467,7 +3644,7 @@ function attachCardsHooksOnce(reason) {
     installStoreNumberArgTrace(module);
     installUserCreditsParserTrace(module);
   }
-  emit('cards-runtime-performance-mode-beta2244', {enabled:RUNTIME_PERFORMANCE_MODE, disabled_hot_traces:['match-bridge','store-passive-wrappers','store-number-arg','user-credits-parser','generic-response-parser','generic-response-scalar','generic-response-key-map','static-asset-state-path-completion','fifa-static-asset-bridge','fifa-module-wrapper','fifa-plugin-loader','full-nav-backtraces'], ui_writer_scope:'MATCH_RECORD/BADGE_ID exact-wrapper windows only'});
+  emit('cards-runtime-performance-mode-beta2244', {enabled:RUNTIME_PERFORMANCE_MODE, disabled_hot_traces:['match-bridge','store-passive-wrappers','store-number-arg','user-credits-parser','generic-response-parser','generic-response-scalar','generic-response-key-map','static-asset-state-path-completion','fifa-static-asset-bridge','fifa-module-wrapper','fifa-plugin-loader','full-nav-backtraces','competition-json-key-on-match-create'], ui_writer_scope:'MATCH_RECORD/BADGE_ID exact-wrapper windows only'});
 
   cardsHooksInstalled = true;
   emit('cards-operation92-hooks-installed', {reason: reason, base: module.base.toString(), hook_count: CARDS_TARGETS.length});
@@ -3571,17 +3748,35 @@ function installFifaNavHooks(fifa) {
             if (view && view.toLowerCase().endsWith('/fcc_logout') && postMatchReturnGuardActive()) {
               const guardGeneration = postMatchReturnGuardGeneration;
               const remainingMs = Math.max(0, postMatchReturnGuardUntilMs - nowMs());
-              args[2] = postMatchStayInFutView;
-              view = 'external/ion_fut/screens/gameHub/GameHub';
-              postMatchReturnGuardUntilMs = 0;
-              postMatchFccLogoutRedirects += 1;
-              postMatchRedirected = true;
-              emit('fifa-postmatch-fcc-logout-redirect-beta223', {
-                generation:guardGeneration, original_view:originalView, replacement_view:view,
-                remaining_ms:remainingMs, redirect_count:postMatchFccLogoutRedirects,
-                rationale:'DestroyMatch completed locally; keep CardsDLL/FUT loaded instead of taking the stale disconnected-from-in-game logout route.',
-                thread_id:tid(), return_address:safePtr(this.returnAddress)
-              });
+              const armedAgeMs = postMatchReturnGuardArmedMs ? (nowMs() - postMatchReturnGuardArmedMs) : 0;
+              // A logout this soon after CreateMatch is the client abandoning
+              // match setup, not returning from one. Let it take its own route:
+              // redirecting it strands a session that is already tearing down.
+              const tooEarly = !postMatchReturnGuardFromMatchEnd && armedAgeMs < PRE_ARM_MIN_ELAPSED_MS;
+              if (tooEarly) {
+                postMatchFccLogoutPassthroughs += 1;
+                emit('fifa-prematch-fcc-logout-passthrough-beta2260', {
+                  generation:guardGeneration, view:originalView, armed_age_ms:armedAgeMs,
+                  min_elapsed_ms:PRE_ARM_MIN_ELAPSED_MS, remaining_ms:remainingMs,
+                  passthrough_count:postMatchFccLogoutPassthroughs,
+                  rationale:'guard was pre-armed by CreateMatch and no /match/end was seen; the client is leaving before kickoff, so do not rewrite its logout route.',
+                  thread_id:tid(), return_address:safePtr(this.returnAddress)
+                });
+              } else {
+                args[2] = postMatchStayInFutView;
+                view = 'external/ion_fut/screens/gameHub/GameHub';
+                postMatchReturnGuardUntilMs = 0;
+                postMatchFccLogoutRedirects += 1;
+                postMatchRedirected = true;
+                emit('fifa-postmatch-fcc-logout-redirect-beta223', {
+                  generation:guardGeneration, original_view:originalView, replacement_view:view,
+                  remaining_ms:remainingMs, armed_age_ms:armedAgeMs,
+                  from_match_end:postMatchReturnGuardFromMatchEnd,
+                  redirect_count:postMatchFccLogoutRedirects,
+                  rationale:'DestroyMatch completed locally; keep CardsDLL/FUT loaded instead of taking the stale disconnected-from-in-game logout route.',
+                  thread_id:tid(), return_address:safePtr(this.returnAddress)
+                });
+              }
             }
             if (view && view.toLowerCase().endsWith('/fcc_login1')) { fccLogin1Active = true; fccLogin2Active = false; }
             if (view && view.toLowerCase().endsWith('/fcc_login2')) { fccLogin2Active = true; fccLogin1Active = false; }
@@ -3610,6 +3805,176 @@ function installFifaNavHooks(fifa) {
     }
   });
   return checks.every(function(value){ return value; });
+}
+
+function safeU32(pointer) {
+  try { return pointer.readU32(); } catch (_) { return null; }
+}
+function safeHex(pointer, length) {
+  try { return hexBytes(listBytes(pointer.readByteArray(length))); } catch (_) { return null; }
+}
+function installAssertReporterDiagnostic(fifa) {
+  const item = ASSERT_REPORTER_TARGET;
+  const address = fifa.base.add(item.rva);
+  const check = verify(address, item.signature);
+  emit('fifa-assert-reporter-signature-beta2259', {
+    name: item.name, rva: '0x' + item.rva.toString(16), address: address.toString(),
+    matched: check.matched, expected: hexBytes(item.signature),
+    actual: check.actual, error: check.error || null
+  });
+  if (!check.matched) return false;
+  try {
+    Interceptor.attach(address, {
+      onEnter(args) {
+        // cdecl: one stack argument, a pointer to the assertion record.
+        const record = safeU32(this.context.esp.add(4));
+        const fields = [];
+        if (record !== null && record !== 0) {
+          item.fieldOffsets.forEach(function (offset) {
+            const value = safeU32(ptr(record).add(offset));
+            const row = {offset: '0x' + offset.toString(16),
+                         value: value === null ? null : '0x' + value.toString(16)};
+            // Two of the three are text (expression and source file); the other
+            // is usually the line number, which will not resolve as a string.
+            if (value !== null && value > 0x10000) {
+              try { row.text = cstring(ptr(value), 512); } catch (_) { row.text = null; }
+            }
+            fields.push(row);
+          });
+        }
+        emit('fifa-assert-reporter-beta2259', {
+          thread_id: tid(), record: record === null ? null : '0x' + record.toString(16),
+          fields: fields, return_address: safePtr(this.returnAddress),
+          backtrace: normalizedBacktrace(this.context)
+        });
+      }
+    });
+    emit('fifa-assert-reporter-hook-ready-beta2259', {address: address.toString()});
+    return true;
+  } catch (error) {
+    emit('fifa-assert-reporter-hook-error-beta2259', {
+      address: address.toString(), error: String(error)
+    });
+    return false;
+  }
+}
+
+function installCupResumeLookupDiagnostic(module) {
+  const item = CUP_RESUME_LOOKUP_TARGET;
+  const address = module.base.add(item.rva);
+  const check = verify(address, item.signature);
+  emit('cards-cup-resume-lookup-signature-beta2259', {
+    name: item.name, rva: '0x' + item.rva.toString(16), address: address.toString(),
+    matched: check.matched, expected: hexBytes(item.signature),
+    actual: check.actual, error: check.error || null
+  });
+  if (!check.matched) return false;
+  try {
+    Interceptor.attach(address, {
+      onEnter(args) {
+        // thiscall: ecx owns the registry, arg0 is the key being looked up.
+        const self = this.context.ecx;
+        const wanted = safeU32(this.context.esp.add(4));
+        const begin = safeU32(self.add(item.beginOffset));
+        const end = safeU32(self.add(item.endOffset));
+        const registered = [];
+        let count = null, matched = false;
+        if (begin !== null && end !== null && end >= begin) {
+          count = (end - begin) / 4;
+          const capped = Math.min(count, item.maxEntries);
+          for (let i = 0; i < capped; i++) {
+            const entry = safeU32(ptr(begin).add(i * 4));
+            if (entry === null || entry === 0) { registered.push(null); continue; }
+            const key = safeU32(ptr(entry).add(item.keyOffset));
+            registered.push(key);
+            if (key !== null && wanted !== null && key === wanted) matched = true;
+          }
+        }
+        emit('cards-cup-resume-lookup-beta2259', {
+          thread_id: tid(), self: safePtr(self),
+          wanted: wanted === null ? null : '0x' + wanted.toString(16),
+          wanted_decimal: wanted,
+          begin: begin === null ? null : '0x' + begin.toString(16),
+          end: end === null ? null : '0x' + end.toString(16),
+          entry_count: count, matched: matched,
+          registered_keys: registered,
+          // A miss is the crash: the not-found path stores NULL and then
+          // dereferences it a few instructions later.
+          will_fault: count !== null && !matched
+        });
+      }
+    });
+    emit('cards-cup-resume-lookup-hook-ready-beta2259', {address: address.toString()});
+    return true;
+  } catch (error) {
+    emit('cards-cup-resume-lookup-hook-error-beta2259', {
+      address: address.toString(), error: String(error)
+    });
+    return false;
+  }
+}
+
+function installMatchEntityTableDiagnostic(fifa) {
+  const item = MATCH_ENTITY_TABLE_TARGET;
+  const address = fifa.base.add(item.rva);
+  const check = verify(address, item.signature);
+  emit('fifa-match-entity-table-signature-beta2259', {
+    name: item.name, rva: '0x' + item.rva.toString(16), address: address.toString(),
+    matched: check.matched, expected: hexBytes(item.signature),
+    actual: check.actual, error: check.error || null
+  });
+  // Never hook an unverified build: the RVA came from one specific crash dump.
+  if (!check.matched) return false;
+  try {
+    Interceptor.attach(address, {
+      onEnter(args) {
+        // thiscall: ecx is the object the crashing loop dereferences.
+        const self = this.context.ecx;
+        const holder = safeU32(self.add(item.contextOffset));
+        const table = (holder === null || holder === 0)
+          ? null : safeU32(ptr(holder).add(item.arrayOffset));
+        const entries = [];
+        let valid = 0, nulls = 0, garbage = 0, unreadable = 0;
+        if (table !== null && table !== 0) {
+          for (let i = 0; i < item.entryCount; i++) {
+            const value = safeU32(ptr(table).add(i * 4));
+            const row = {index: i, value: value === null ? null : '0x' + value.toString(16)};
+            if (value === null) { row.state = 'unreadable'; unreadable += 1; }
+            else if (value === 0) { row.state = 'null'; nulls += 1; }
+            else if (value === 0xcdcdcdcd) { row.state = 'uninitialized'; garbage += 1; }
+            else {
+              row.state = 'valid'; valid += 1;
+              // The faulting instruction is mov eax,[entry+0x20] followed by
+              // cmp dword [eax+0x7c],0, so record both links plus a header
+              // sample to identify what these entities actually are.
+              const sub = safeU32(ptr(value).add(0x20));
+              row.at_0x20 = sub === null ? null : '0x' + sub.toString(16);
+              if (sub !== null && sub !== 0 && sub !== 0xcdcdcdcd) {
+                const inner = safeU32(ptr(sub).add(0x7c));
+                row.at_0x20_0x7c = inner === null ? null : '0x' + inner.toString(16);
+              }
+              row.header = safeHex(ptr(value), 0x30);
+            }
+            entries.push(row);
+          }
+        }
+        emit('fifa-match-entity-table-beta2259', {
+          thread_id: tid(), self: safePtr(self),
+          holder: holder === null ? null : '0x' + holder.toString(16),
+          table: table === null ? null : '0x' + table.toString(16),
+          entry_count: item.entryCount, valid: valid, null_entries: nulls,
+          uninitialized: garbage, unreadable: unreadable, entries: entries
+        });
+      }
+    });
+    emit('fifa-match-entity-table-hook-ready-beta2259', {address: address.toString()});
+    return true;
+  } catch (error) {
+    emit('fifa-match-entity-table-hook-error-beta2259', {
+      address: address.toString(), error: String(error)
+    });
+    return false;
+  }
 }
 
 function installFifaModuleWrapperHooks(fifa) {
@@ -3656,6 +4021,8 @@ hookConnect('WSAConnect');
 hookDnsA('getaddrinfo');
 hookDnsW('GetAddrInfoW');
 hookHostByName();
+hookDebugOutput('OutputDebugStringA', false);
+hookDebugOutput('OutputDebugStringW', true);
 hookSend();
 hookWSASend();
 hookRecv();
@@ -3678,6 +4045,10 @@ if (buildOk) {
   if (!RUNTIME_PERFORMANCE_MODE) installFifaModuleWrapperHooks(fifa);
   else emit('fifa-module-wrapper-diagnostics-disabled-beta2244', {reason:'pack runtime fast path'});
   installFifaNavHooks(fifa);
+  // Runs once per match load, so it stays armed even in performance mode.
+  installMatchEntityTableDiagnostic(fifa);
+  // Armed early so any assert anywhere in the session reports its own text.
+  installAssertReporterDiagnostic(fifa);
   try {
     navSendActionFunction = new NativeFunction(fifa.base.add(0x006fda50), 'void', ['pointer','pointer','pointer'], 'stdcall');
     emit('authenticated-icebreaker-nav-send-action-callable', {address:fifa.base.add(0x006fda50).toString(), calling_convention:'stdcall', ignored_arg0:true});

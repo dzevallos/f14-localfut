@@ -14,8 +14,15 @@ if str(SERVER) not in sys.path:
     sys.path.insert(0, str(SERVER))
 
 import beta_identity as beta_identity_module
-from beta_identity import BetaIdentityStore, OFFLINE_COMPETITION_TEAM_IDS
-from local_identity import PLAYER_CATALOG
+import fut_local_settings
+from beta_identity import (
+    BetaIdentityStore,
+    OFFLINE_COMPETITION_TEAM_IDS,
+    OFFLINE_TOURNAMENTS,
+    TOURNAMENT_TEAM_POOLS,
+    MATCH_RESULT_FLAT_COINS,
+)
+from local_identity import MARKET_CONSUMABLE_BUY_NOW, PACK_DEFINITIONS, PLAYER_CATALOG
 from probe import HttpProbe
 
 
@@ -288,7 +295,12 @@ def main() -> int:
             "visEnd", "trophyResourceId", "trophyUserCount",
         }
         guessed_cup_keys = {"tournamentId", "name", "level", "prize", "repeatPrize", "currentRound", "entryFee", "active", "won"}
-        expected_prizes = {1: 500, 2: 750, 3: 1000, 4: 1500}
+        # Prizes are local tuning, so take them from the definitions rather than
+        # from literals. What this protects is the parser-native awardSet shape
+        # and that the advertised value is the configured one.
+        expected_prizes = {
+            int(row["tournamentId"]): int(row["prize"]) for row in OFFLINE_TOURNAMENTS
+        }
         if [int(row.get("id", 0)) for row in tournament_rows] != [1, 2, 3, 4]:
             fail(f"tournament IDs/order regressed: {tournament_rows}")
         for cup in tournament_rows:
@@ -312,9 +324,51 @@ def main() -> int:
         if list(teams) != ["teamId"] or len(teams.get("teamId", [])) != 15:
             fail(f"tournament/teams must return only a 15-element teamId array: {teams}")
         if teams["teamId"] != list(OFFLINE_COMPETITION_TEAM_IDS):
-            fail(f"tournament team pool is not deterministic: {teams}")
+            fail(f"tournament team pool without a groupId must stay the shared fallback: {teams}")
         if any(int(team_id) not in valid_team_ids for team_id in teams["teamId"]):
             fail(f"tournament team pool contains an unknown retail club: {teams}")
+        # Each cup draws its own opponents: the client asks
+        # /teams?groupId=<aigroup>&count=15, so aigroup has to be distinct per
+        # cup and every pool has to be a full, renderable, in-catalogue bracket.
+        cup_groups = {int(cup["id"]): int(cup["aigroup"]) for cup in tournament_rows}
+        if sorted(cup_groups.values()) != sorted(set(cup_groups.values())):
+            fail(f"cups must not share an AI group or they field the same clubs: {cup_groups}")
+        seen_clubs: set[int] = set()
+        tier_strength: list[tuple[int, float]] = []
+        for cup_id, group_id in sorted(cup_groups.items()):
+            if group_id not in TOURNAMENT_TEAM_POOLS:
+                fail(f"cup {cup_id} advertises AI group {group_id} with no team pool")
+            pool = store.offline_tournament_teams(15, group_id=group_id)["teamId"]
+            if len(pool) != 15 or len(set(pool)) != 15:
+                fail(f"cup {cup_id} needs fifteen distinct opponents for a 16-team bracket: {pool}")
+            if any(int(team_id) not in valid_team_ids for team_id in pool):
+                fail(f"cup {cup_id} pool contains a club with no players in the catalogue: {pool}")
+            if seen_clubs.intersection(pool):
+                fail(f"cup {cup_id} repeats clubs from an easier cup: {sorted(seen_clubs.intersection(pool))}")
+            seen_clubs.update(pool)
+            ratings_by_team: dict[int, list[int]] = {}
+            for player in PLAYER_CATALOG:
+                team_id = int(player.get("teamId", 0))
+                if team_id in set(pool):
+                    ratings_by_team.setdefault(team_id, []).append(int(player.get("rating", 0)))
+            best_eighteen = [
+                sum(sorted(ratings, reverse=True)[:18]) / len(sorted(ratings, reverse=True)[:18])
+                for ratings in ratings_by_team.values() if ratings
+            ]
+            tier_strength.append((cup_id, sum(best_eighteen) / len(best_eighteen)))
+        # The whole point of the tiers: a bronze starter club must not draw the
+        # European elite in the Starter Cup. Assert the ladder climbs, not the
+        # exact means, so the pools can be retuned without a false regression.
+        if [cup for cup, _ in tier_strength] != sorted(cup_groups):
+            fail(f"tier strengths were not measured in cup order: {tier_strength}")
+        for (lower_cup, lower), (higher_cup, higher) in zip(tier_strength, tier_strength[1:]):
+            if higher <= lower + 2:
+                fail(
+                    f"cup {higher_cup} ({higher:.1f}) is not a meaningful step up from cup "
+                    f"{lower_cup} ({lower:.1f}); the cup ladder no longer scales"
+                )
+        if tier_strength[0][1] > 65:
+            fail(f"Starter Cup opponents average {tier_strength[0][1]:.1f}; too strong for a bronze club")
         tournament_progress = store.update_offline_tournament_user(1, {
             "round": 1, "dataVersion": 1, "tournamentData": "fixture-data",
             "progressDataVersion": 1, "progressData": "AAAAAA==",
@@ -573,18 +627,25 @@ def main() -> int:
             "offsides": 2,
             "multiplier": 1.0,
         })
-        if result["rewardCoins"] != 634 or result["credits"] != 634:
-            fail(f"FUT14 reward regression: expected 634, got {result}")
+        # A completed win pays the configured flat amount and the wallet must
+        # move by exactly that. Assert against the constant so a retune does
+        # not read as a regression.
+        expected_win = int(MATCH_RESULT_FLAT_COINS["WIN"])
+        if result["rewardCoins"] != expected_win or result["credits"] != expected_win:
+            fail(f"FUT14 reward regression: expected {expected_win}, got {result}")
         replay = store.settle_match({"matchId": "verify-match", "completed": 1, "minutesPlayed": 90})
-        if not replay.get("idempotent") or replay["credits"] != 634:
+        if not replay.get("idempotent") or replay["credits"] != expected_win:
             fail(f"match reward paid more than once: {replay}")
 
         # A bronze pack can now be bought from earned match coins. It must debit
         # the wallet and produce a ledger entry, while the original dev profile
         # remains unrelated because this is a dedicated BETA DB.
+        bronze_price = int(PACK_DEFINITIONS[1]["priceCoins"])
+        expected_after_pack = expected_win - bronze_price
         pack = store.purchase_pack(1, currency="COINS")
-        if int(pack.get("credits", -1)) != 234:
-            fail(f"400-coin Bronze Pack should leave 234 from 634, got {pack.get('credits')}")
+        if int(pack.get("credits", -1)) != expected_after_pack:
+            fail(f"{bronze_price}-coin Bronze Pack should leave {expected_after_pack} "
+                 f"from {expected_win}, got {pack.get('credits')}")
         ledger = store.wallet_ledger(20)["transactions"]
         reasons = {row["reason"] for row in ledger}
         if not {"MATCH_REWARD", "PACK_PURCHASE"}.issubset(reasons):
@@ -592,8 +653,232 @@ def main() -> int:
         metrics = store.metrics()
         if metrics["packsOpenedToday"] != 1 or metrics["matchesCompletedToday"] != 1 or metrics["matchesAbandonedToday"] != 1:
             fail(f"BETA counters invalid: {metrics}")
-        if metrics["coinsInCirculation"] != 234:
-            fail(f"economy circulation should equal 234 in one-account verifier, got {metrics['coinsInCirculation']}")
+        if metrics["coinsInCirculation"] != expected_after_pack:
+            fail(f"economy circulation should equal {expected_after_pack} in one-account verifier, "
+                 f"got {metrics['coinsInCirculation']}")
+
+        # A cup at a later round with no saved bracket must never be advertised or
+        # served as resumable. Winning a non-final round stores round+1 with a
+        # blank tournamentData and waits for the client to PUT the bracket; a
+        # client that never returns leaves exactly this state, and serving it
+        # crashed FIFA on 2026-08-15 (808,335,154-byte EASTL vector, out of
+        # memory) because the empty buffer put the response members in the order
+        # the stream parser cannot read.
+        crash_store = BetaIdentityStore(str(Path(td) / "beta-resume.sqlite3"), "existing")
+        if crash_store._tournament_progress_is_resumable(2, "", ""):
+            fail("a later round with no saved bracket must not count as resumable")
+        if crash_store._tournament_progress_is_resumable(4, "   ", "AAAAAA=="):
+            fail("whitespace-only tournamentData is not a bracket")
+        if not crash_store._tournament_progress_is_resumable(2, "saved-bracket", ""):
+            fail("a later round WITH a saved bracket must stay resumable")
+        with closing(sqlite3.connect(Path(td) / "beta-resume.sqlite3")) as poison, poison:
+            poison.execute(
+                "INSERT INTO beta_tournament_progress (persona_id,tournament_id,round_value,"
+                "data_version,tournament_data,progress_data_version,progress_data,updated_at) "
+                "VALUES (1000001,4,2,1,'',1,'',0) "
+                "ON CONFLICT(persona_id,tournament_id) DO UPDATE SET round_value=2,tournament_data='',progress_data=''"
+            )
+        if crash_store.offline_tournament_user_list().get("tournamentId") != []:
+            fail("a bracket-less cup must not be advertised as Underway")
+        served = crash_store.offline_tournament_user(4)
+        if served != {"tournamentId": 4}:
+            fail(f"a bracket-less cup must not be served as a resume document: {served}")
+
+        # The developer test float is a top-up, not a one-shot grant. It used to be
+        # keyed on a fixed build reference, so once that ledger row existed the tool
+        # silently did nothing for the life of the save.
+        float_store = BetaIdentityStore(str(Path(td) / "beta-float.sqlite3"), "existing")
+        first = float_store.ensure_consumables_beta_test_balance(1_000_000)
+        if int(first.get("balanceAfter", 0)) != 1_000_000 or first.get("idempotent"):
+            fail(f"test float did not top the club up to the target: {first}")
+        repeat = float_store.ensure_consumables_beta_test_balance(1_000_000)
+        if int(repeat.get("granted", -1)) != 0 or not repeat.get("idempotent"):
+            fail(f"test float must not stack once the club is at the target: {repeat}")
+        if int(float_store.credits()["credits"]) != 1_000_000:
+            fail(f"repeat top-up moved the balance: {float_store.credits()}")
+        spent = int(PACK_DEFINITIONS[1]["priceCoins"])
+        float_store.purchase_pack(1, currency="COINS")
+        if int(float_store.credits()["credits"]) != 1_000_000 - spent:
+            fail("test-float club could not spend normally after the top-up")
+        restored = float_store.ensure_consumables_beta_test_balance(1_000_000)
+        if int(restored.get("granted", 0)) != spent or int(restored.get("balanceAfter", 0)) != 1_000_000:
+            fail(f"a spent test float must be restorable for the next test round: {restored}")
+        grants = [
+            row for row in float_store.wallet_ledger(20)["transactions"]
+            if row["reason"] == "BETA_CONSUMABLES_TEST_GRANT"
+        ]
+        if len(grants) != 2:
+            fail(f"each top-up needs its own ledger row: {grants}")
+
+        # BUG-002: "Create New Squad" is POST /ut/game/fifa14/squad with "id":0 and
+        # no id in the path -- the exact bodies captured in redirect-probe.log. It
+        # used to resolve to the *active* squad, so a new squad was never created
+        # and the "COPY <name>" variant overwrote squad 1. Run it against its own
+        # DB so the economy assertions above stay on a single-squad club.
+        squads_db = Path(td) / "beta-squads.sqlite3"
+        squads_store = BetaIdentityStore(str(squads_db), "existing")
+        default_squad = squads_store.squad_list()["squadList"][0]
+        default_ids = [int((row.get("itemData") or {}).get("id", 0) or 0) for row in default_squad["players"]]
+        created = squads_store.save_squad({
+            "id": 0, "squadName": "usa", "chemistry": 0, "starRating": 0, "rating": 0,
+            "formation": "f442", "manager": [{"id": 0}], "players": [],
+        }, requested_id=None)
+        new_id = int(created.get("createdSquadId", 0) or 0)
+        if new_id <= int(default_squad["id"]):
+            fail(f"POST /squad with id 0 must INSERT a new squad, got createdSquadId={created.get('createdSquadId')}")
+        listing = {int(row["id"]): row for row in squads_store.squad_list()["squadList"]}
+        if len(listing) != 2:
+            fail(f"create must leave the original squad in place: {sorted(listing)}")
+        untouched = listing[int(default_squad["id"])]
+        if [int((row.get("itemData") or {}).get("id", 0) or 0) for row in untouched["players"]] != default_ids:
+            fail("creating a squad rewrote the existing squad's players")
+        if untouched["squadName"] != default_squad["squadName"] or not untouched["active"]:
+            fail(f"the existing squad must stay named and active while a new squad is empty: {untouched['squadName']}")
+        fresh = listing[new_id]
+        if fresh["squadName"] != "usa" or fresh["active"]:
+            fail(f"new squad metadata wrong: name={fresh['squadName']} active={fresh['active']}")
+        if len(fresh["players"]) != 23 or any(int((row.get("itemData") or {}).get("id", 0) or 0) for row in fresh["players"]):
+            fail(f"a new squad must be 23 empty slots: {fresh['players']}")
+
+        # Building it up one card at a time is a run of PUT /squad/{id} bodies that
+        # each carry an empty squadName and far fewer than eleven players. Neither
+        # the sparse guard nor the bootstrap auto-fill may touch them.
+        for count in (1, 3, 6):
+            partial = [{"index": i, "itemData": {"id": default_ids[i] if i < count else 0}, "kitNumber": 0}
+                       for i in range(23)]
+            squads_store.save_squad({
+                "id": new_id, "squadName": "", "formation": "f4141",
+                "chemistry": 0, "starRating": 0, "players": partial,
+            }, requested_id=new_id)
+            built = squads_store.squad_detail(new_id)
+            placed = sum(1 for row in built["players"] if int((row.get("itemData") or {}).get("id", 0) or 0) > 0)
+            if placed != count:
+                fail(f"partial squad build lost players: sent {count}, stored {placed}")
+            if built["squadName"] != "usa":
+                fail(f"a nameless PUT renamed the squad to {built['squadName']!r}")
+        if [int((row.get("itemData") or {}).get("id", 0) or 0)
+                for row in squads_store.squad_detail(int(default_squad["id"]))["players"]] != default_ids:
+            fail("building a second squad disturbed the first one")
+
+        # FIFA fields both teams through a fixed 22-entry entity table, so the six
+        # player squad above must never reach the match builder.
+        match_squad = squads_store.create_match({"squadId": 0, "type": "OFFLINE"})["squad"]
+        fieldable = sum(1 for row in match_squad.get("players", []) if int((row.get("itemData") or {}).get("id", 0) or 0) > 0)
+        if fieldable < 11:
+            fail(f"CreateMatch served a squad that cannot field eleven players: {fieldable}")
+        squads_store.reset_match({})
+
+        # Renaming from the squad selector PUTs the squad with no players array.
+        # save_squad used to return early on that shape -- correct for the retail
+        # tournament handoff (captain/kicktakers, no name) but it also swallowed
+        # every rename, so a new name never stuck.
+        renamed_players = squads_store.squad_detail(new_id)["players"]
+        squads_store.save_squad({"id": new_id, "squadName": "Renamed XI"}, requested_id=new_id)
+        after_rename = squads_store.squad_detail(new_id)
+        if after_rename["squadName"] != "Renamed XI":
+            fail(f"a name-only squad PUT must rename the squad: {after_rename['squadName']!r}")
+        if after_rename["players"] != renamed_players:
+            fail("renaming a squad must not disturb its players")
+        squads_store.save_squad(
+            {"id": new_id, "captain": default_ids[0], "kicktakers": [default_ids[0]]},
+            requested_id=new_id,
+        )
+        if squads_store.squad_detail(new_id)["squadName"] != "Renamed XI":
+            fail("the player-less tournament handoff PUT must not touch the name")
+        # A rename can also ride along on a write the sparse guard rejects. The
+        # guard still has to protect the players, but the typed name is not part
+        # of the parser hiccup: every captured sparse write has an empty name.
+        blank = [{"index": i, "itemData": {"id": 0}, "kitNumber": 0} for i in range(23)]
+        before_sparse_rename = squads_store.squad_detail(int(default_squad["id"]))["players"]
+        squads_store.save_squad({
+            "id": int(default_squad["id"]), "squadName": "Sparse Rename",
+            "formation": "f442", "chemistry": 0, "starRating": 0, "players": blank,
+        }, requested_id=int(default_squad["id"]))
+        sparse_renamed = squads_store.squad_detail(int(default_squad["id"]))
+        if sparse_renamed["squadName"] != "Sparse Rename":
+            fail(f"a rename carried on a sparse write was swallowed: {sparse_renamed['squadName']!r}")
+        if sparse_renamed["players"] != before_sparse_rename:
+            fail("the sparse-write guard stopped protecting the 23 slots")
+
+        # "Copy Squad" posts the same id 0 with a full 23-slot players array.
+        copied = squads_store.save_squad({
+            "id": 0, "squadName": "COPY  Local XI", "chemistry": 56, "starRating": 60, "rating": 60,
+            "formation": "f4141", "manager": [{"id": 0}],
+            "players": json.loads(json.dumps(default_squad["players"])),
+        }, requested_id=None)
+        copy_id = int(copied.get("createdSquadId", 0) or 0)
+        if copy_id in (0, new_id, int(default_squad["id"])):
+            fail(f"copy-squad POST must create a third squad, got {copy_id}")
+        copy_detail = squads_store.squad_detail(copy_id)
+        if [int((row.get("itemData") or {}).get("id", 0) or 0) for row in copy_detail["players"]] != default_ids:
+            fail("copied squad did not reproduce the source players")
+        if [int((row.get("itemData") or {}).get("id", 0) or 0)
+                for row in squads_store.squad_detail(int(default_squad["id"]))["players"]] != default_ids:
+            fail("copy-squad POST overwrote the squad it copied")
+
+        # Clearing the club must land on the *same* starter state a first run
+        # provisions -- it reuses that code path rather than defining a second
+        # idea of "starter" -- and must keep the wallet, because setting a
+        # balance is a separate decision from wiping the cards.
+        reset_store = BetaIdentityStore(str(Path(td) / "beta-reset.sqlite3"), "existing")
+        fresh_profile = reset_store.beta_profile_summary()
+        reset_store.ensure_consumables_beta_test_balance(40_000)
+        # Buying puts a real owned row in the club, which is what the reset has
+        # to clear; an unopened pack alone would not prove anything.
+        bought_consumable = reset_store.market_search(
+            {"type": ["consumables"], "start": ["0"], "num": ["1"]}
+        )["auctionInfo"][0]
+        reset_store.market_bid(int(bought_consumable["tradeId"]), MARKET_CONSUMABLE_BUY_NOW)
+        reset_store.save_squad({
+            "id": 0, "squadName": "Doomed", "formation": "f442", "players": [],
+        }, requested_id=None)
+        coins_before_reset = int(reset_store.credits()["credits"])
+        if int(reset_store.beta_profile_summary()["ownedItems"]) <= int(fresh_profile["ownedItems"]):
+            fail("the reset fixture did not actually add anything to the club")
+        after_reset = reset_store.reset_club_to_starter()
+        if int(after_reset["ownedItems"]) != int(fresh_profile["ownedItems"]):
+            fail(f"reset club is not the provisioned starter club: {after_reset['ownedItems']} "
+                 f"items vs {fresh_profile['ownedItems']} on a first run")
+        if int(after_reset["squadPlayers"]) != int(fresh_profile["squadPlayers"]):
+            fail(f"reset starter squad is incomplete: {after_reset['squadPlayers']}")
+        if int(reset_store.credits()["credits"]) != coins_before_reset:
+            fail("clearing the club must not change the coin balance")
+        reset_squads = reset_store.squad_list()["squadList"]
+        if len(reset_squads) != 1 or reset_squads[0]["squadName"] != "Starter XI":
+            fail(f"reset left extra squads behind: {[s['squadName'] for s in reset_squads]}")
+        if reset_store.offline_tournament_user_list().get("tournamentId") != []:
+            fail("reset left a cup advertised as underway")
+        if len(reset_store.create_match({"squadId": 0, "type": "OFFLINE"})["squad"]["players"]) != 23:
+            fail("a reset club cannot start a match")
+
+        # The settings file overlays the built-in tuning. What matters is that a
+        # malformed or hostile file can never take the server down: the launcher
+        # runs this suite before startup and throws away its own output, so an
+        # exception here is a window that closes with no message.
+        settings_file = Path(td) / "settings-probe.json"
+        os.environ["FIFA14_LOCAL_SETTINGS"] = str(settings_file)
+        try:
+            settings_file.write_text('{"matchRewards": {"WIN": -5, "DRAW": "abc"}, '
+                                     '"market": {"rotationFraction": 99999}}', encoding="utf-8")
+            loaded = fut_local_settings.load_settings(refresh=True)
+            if loaded.get("matchRewards", {}).get("WIN") != 0:
+                fail(f"a negative payout must clamp to zero, got {loaded}")
+            if "DRAW" in loaded.get("matchRewards", {}):
+                fail(f"a non-numeric payout must be dropped, not coerced: {loaded}")
+            if loaded.get("market", {}).get("rotationFraction") != 64:
+                fail(f"an absurd rotation fraction must clamp: {loaded}")
+            settings_file.write_text("{ not json at all", encoding="utf-8")
+            if fut_local_settings.load_settings(refresh=True) != {}:
+                fail("a malformed settings file must be ignored, not partially applied")
+            settings_file.write_text('["not", "an", "object"]', encoding="utf-8")
+            if fut_local_settings.load_settings(refresh=True) != {}:
+                fail("a non-object settings file must be ignored")
+            settings_file.unlink()
+            if fut_local_settings.load_settings(refresh=True) != {}:
+                fail("a missing settings file must read as no overrides")
+        finally:
+            os.environ.pop("FIFA14_LOCAL_SETTINGS", None)
+            fut_local_settings.load_settings(refresh=True)
 
         # sqlite3.Connection.__exit__ commits/rolls back but does NOT close the
         # underlying handle. Windows therefore keeps the TemporaryDirectory DB
@@ -614,8 +899,8 @@ def main() -> int:
             "offlineTournamentsDefault": len(tournament_rows),
             "offlineTournamentRounds": len(rounds),
             "storeSafeTierAssets": {str(int(row["packType"])): int(row["assetId"]) for row in offers},
-            "verificationMatchReward": 634,
-            "postPackCoins": 234,
+            "verificationMatchReward": expected_win,
+            "postPackCoins": expected_after_pack,
             "walletLedgerEntries": len(ledger),
             "metrics": metrics,
         }, indent=2))

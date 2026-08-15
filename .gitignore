@@ -30,6 +30,9 @@ certs/
 state/
 dist/
 
+# Windows shortcuts embed the creator's absolute paths and user name
+*.lnk
+
 # Temporary / backup files
 *.log
 *.tmp

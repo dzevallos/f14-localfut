@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "server"))
 sys.path.insert(0, str(ROOT))
 
-from beta_identity import BetaIdentityStore  # noqa: E402
+from beta_identity import BetaIdentityStore, MATCH_RESULT_FLAT_COINS  # noqa: E402
 
 
 def require(condition: bool, message: str) -> None:
@@ -81,8 +81,12 @@ def main() -> int:
             dnf = float(con.execute("SELECT dnf_modifier FROM beta_accounts LIMIT 1").fetchone()[0])
         require(row is not None, "completed match was not persisted")
         breakdown = json.loads(row[1])
-        require(int(breakdown.get("completionAward", 0)) == 325, f"completion award wrong: {breakdown}")
-        require(int(breakdown.get("skillAward", 0)) > 0, f"skill award remained zero: {breakdown}")
+        # Completed results pay the configured flat amount by result, published
+        # as the completion component with no stat-derived skill component.
+        require(int(breakdown.get("completionAward", 0)) == int(MATCH_RESULT_FLAT_COINS["WIN"]),
+                f"completion award is not the configured flat WIN payout: {breakdown}")
+        require(int(breakdown.get("skillAward", -1)) == 0,
+                f"flat payout must not publish a stat-derived skill award: {breakdown}")
         require(int(breakdown.get("goalsFor", -1)) == 8, f"per-player goals overrode 8-0 team score: {breakdown}")
         require(int(row[0]) == int(breakdown["totalCoins"]) == after - before, "wallet and match reward diverged")
         require(dnf >= 0.25, f"legacy zero DNF multiplier was not repaired: {dnf}")
@@ -96,8 +100,8 @@ def main() -> int:
         "status": "ok",
         "build": "2.41.1-beta2.25.9",
         "completedSeconds": 5400,
-        "completionAward": 325,
-        "skillAwardNonZero": True,
+        "completionAward": int(MATCH_RESULT_FLAT_COINS["WIN"]),
+        "flatResultPayout": True,
         "legacyDnfFloor": 0.25,
         "fullMatchReturnGuardMinutes": 45,
     }, indent=2))
