@@ -13,7 +13,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "server"))
 sys.path.insert(0, str(ROOT))
 
-from beta_identity import BetaIdentityStore  # noqa: E402
+from beta_identity import (  # noqa: E402
+    BetaIdentityStore,
+    MATCH_RESULT_FLAT_COINS,
+    OFFLINE_TOURNAMENTS,
+)
 from probe import (  # noqa: E402
     GAME_REPORTING_COMPONENT,
     GAME_REPORTING_RESULT_NOTIFICATION,
@@ -29,6 +33,17 @@ from probe import (  # noqa: E402
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise SystemExit(f"BETA 2.25.9 verifier failed: {message}")
+
+
+def gold_cup_round_difficulty(round_number: int) -> int:
+    """The configured AI level for a Gold Cup round.
+
+    What is under test is that the server *restores* the round difficulty when
+    FIFA omits matchDifficulty from /match/end, so read it from the ladder
+    instead of pinning a number that a difficulty retune would break.
+    """
+    definition = next(row for row in OFFLINE_TOURNAMENTS if int(row["tournamentId"]) == 4)
+    return int(definition["rounds"][int(round_number) - 1][0])
 
 
 def main() -> int:
@@ -89,9 +104,17 @@ def main() -> int:
 
         require(response.get("endReason") == "WIN", f"wrong end reason: {response}")
         require(int(response.get("secondsPlayed", 0)) == 5400, f"completed seconds wrong: {response}")
-        require(int(response.get("matchDifficulty", 0)) == 3, f"Gold Cup difficulty was not restored: {response}")
-        require(int(response.get("completionAward", 0)) == 325, f"completion award missing: {response}")
-        require(int(response.get("skillAward", 0)) > 0, f"skill award missing: {response}")
+        require(int(response.get("matchDifficulty", 0)) == gold_cup_round_difficulty(1),
+                f"Gold Cup difficulty was not restored: {response}")
+        # A completed result pays a flat, result-based amount, published entirely
+        # as the completion component with no stat-derived skill component.
+        expected_win = int(MATCH_RESULT_FLAT_COINS["WIN"])
+        require(int(response.get("completionAward", 0)) == expected_win,
+                f"completion award is not the configured flat WIN payout: {response}")
+        require(int(response.get("skillAward", -1)) == 0,
+                f"flat payout must not publish a stat-derived skill award: {response}")
+        require(int(response.get("totalCoins", 0)) == expected_win,
+                f"total coins is not the configured flat WIN payout: {response}")
         require(int(response.get("rewardCoins", 0)) == after - before, "DestroyMatch reward does not match wallet delta")
         require(int(response.get("credits", -1)) == after, "DestroyMatch credits are stale")
         require(int(response.get("tournamentId", 0)) == 4, f"tournament identity missing: {response}")
@@ -110,6 +133,27 @@ def main() -> int:
                 f"canonical tournament state wrong: {dict(state) if state else None}")
         require(progress is not None and int(progress["round_value"]) == 2,
                 f"wire tournament round was not persisted: {dict(progress) if progress else None}")
+        # Settlement advances the round and deliberately blanks the bracket; the
+        # client PUTs its own tournamentData immediately afterwards. Until it
+        # does, there is no bracket to resume, and advertising one is what
+        # crashed FIFA on 2026-08-15 -- it read a length out of the buffer that
+        # precedes the missing one and asked for an 808,335,154-byte vector.
+        require(progress is not None and not str(progress["tournament_data"] or ""),
+                "settlement is expected to blank the bracket for the client to rewrite")
+        require(store.offline_tournament_user_list().get("tournamentId") == [],
+                f"a cup with no saved bracket must not be advertised yet: {store.offline_tournament_user_list()}")
+        require(store.offline_tournament_user(4) == {"tournamentId": 4},
+                f"a cup with no saved bracket must not be served as resumable: {store.offline_tournament_user(4)}")
+        # Now the half of the round-trip the client performs. This is what the
+        # 2026-08-14 capture shows it sending right after a settled round, and
+        # only after it lands is the cup genuinely resumable at round 2.
+        store.update_offline_tournament_user(4, {
+            "round": 2,
+            "dataVersion": 1,
+            "tournamentData": "beta2259-gold-cup-round2-bracket",
+            "progressDataVersion": 1,
+            "progressData": "KAAAAAAAAAAB",
+        })
         require(store.offline_tournament_user_list().get("tournamentId") == [4],
                 f"resumable tournament was not advertised: {store.offline_tournament_user_list()}")
         require(int(store.offline_tournament_user(4).get("round", 0)) == 2,
@@ -127,7 +171,8 @@ def main() -> int:
             "opponentMatchStats": {"goals": 1},
             "matchData": "beta2259-gold-cup-round2-loss",
         })
-        require(int(loss.get("matchDifficulty", 0)) == 3, f"round-2 difficulty wrong: {loss}")
+        require(int(loss.get("matchDifficulty", 0)) == gold_cup_round_difficulty(2),
+                f"round-2 difficulty wrong: {loss}")
         require(store.offline_tournament_user_list().get("tournamentId") == [],
                 "loss did not reset knockout resume state")
 
@@ -152,7 +197,7 @@ def main() -> int:
     print(json.dumps({
         "status": "ok",
         "build": "2.41.1-beta2.25.9",
-        "goldCupRound1Difficulty": 3,
+        "goldCupRound1Difficulty": gold_cup_round_difficulty(1),
         "roundAfterWin": 2,
         "completionAward": 325,
         "walletMatchesDestroyMatch": True,

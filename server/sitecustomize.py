@@ -49,11 +49,21 @@ def _patch_beta_identity(module: Any) -> None:
             # client-facing terminal acknowledgement.  Retail FIFA otherwise
             # treats a successful local QUIT/DNF as a server disconnect and
             # routes into fcc_logout / the endless Leaving Ultimate Team path.
+            # What keeps FIFA out of fcc_logout is the LOSS *shape*, not the
+            # numbers, so report whatever the DNF payout is actually set to
+            # rather than a hard zero. It is 0 unless the user configured one,
+            # in which case the wallet has already been credited and reporting 0
+            # here would make the result screen contradict the balance.
+            try:
+                from beta_identity import MATCH_RESULT_FLAT_COINS
+                dnf_award = int(MATCH_RESULT_FLAT_COINS.get("DNF", 0))
+            except Exception:
+                dnf_award = 0
             response["endReason"] = "LOSS"
-            response["completionAward"] = 0
+            response["completionAward"] = dnf_award
             response["skillAward"] = 0
-            response["rewardCoins"] = 0
-            response["totalCoins"] = 0
+            response["rewardCoins"] = dnf_award
+            response["totalCoins"] = dnf_award
             credits = int(self.credits().get("credits", 0) or 0)
             response["credits"] = credits
             response["coins"] = credits

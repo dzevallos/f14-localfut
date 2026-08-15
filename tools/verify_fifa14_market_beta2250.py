@@ -34,6 +34,14 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="fifa14-beta2255-") as td:
         store = li.LocalIdentityStore(Path(td) / "market.sqlite3", initial_mode="new")
         store.create_club("Market Test", "MKT")
+        # The pricing/Buy Now/tax contracts below are about one specific card and
+        # the whole-market totals, so they run with rotation off. Which cards a
+        # rotation happens to stock is exercised separately at the end -- leaving
+        # it on here would make Ronaldo appear in only one run out of
+        # MARKET_ROTATION_FRACTION.
+        rotation_fraction = li.MARKET_ROTATION_FRACTION
+        consumable_listings = len(li.MARKET_CONSUMABLE_CATALOG) * li.MARKET_CONSUMABLE_COPIES
+        li.MARKET_ROTATION_FRACTION = 1
         payload = store._canonical_player_payload(item_id=181000000001, asset_id=152729, existing=pique, pile=7)
         keys = list(payload)
         require(payload["preferredPosition"] == "CB", f"Pique position is {payload['preferredPosition']!r}, expected CB")
@@ -46,8 +54,8 @@ def main() -> int:
 
         # The hub tile must report the whole synthetic market, not only the user's listings.
         hub = store.hub_data()
-        require(int(hub.get("auctionCount", 0)) == li.MARKET_LIVE_LISTING_COUNT,
-                f"hub live transfers {hub} != synthetic market {li.MARKET_LIVE_LISTING_COUNT}")
+        require(int(hub.get("auctionCount", 0)) == li.MARKET_LIVE_LISTING_COUNT + consumable_listings,
+                f"hub live transfers {hub} != synthetic market {li.MARKET_LIVE_LISTING_COUNT} + consumables")
 
         # Unfiltered market total is listing count (3-7 copies/card), not unique-card count.
         all_market = store.market_search({"start": ["0"], "num": ["12"]})
@@ -79,7 +87,7 @@ def main() -> int:
         require(any(int(x.get("id", 0)) == bought_id for x in pending.get("itemData", [])), "market win missing from New Items")
         refreshed = store.market_search({"definitionId": ["20801"], "start": ["0"], "num": ["100"]})
         require(not any(int(a["tradeId"]) == trade_id for a in refreshed["auctionInfo"]), "bought synthetic auction regenerated immediately")
-        require(store.hub_data()["auctionCount"] == li.MARKET_LIVE_LISTING_COUNT - 1,
+        require(store.hub_data()["auctionCount"] == li.MARKET_LIVE_LISTING_COUNT - 1 + consumable_listings,
                 "hub did not remove recently sold synthetic auction")
         with closing(sqlite3.connect(store.database)) as con:
             trend = con.execute("SELECT pressure,total_buys FROM market_trends WHERE resource_id=20801").fetchone()
@@ -106,7 +114,7 @@ def main() -> int:
         require(active_pile.get("tradePileCount") == 1 and active_pile.get("transferListCount") == 1,
                 f"transfer-list summary aliases did not report one item: {active_pile}")
         owner_hub = store.hub_data()
-        require(owner_hub["auctionCount"] == li.MARKET_LIVE_LISTING_COUNT,
+        require(owner_hub["auctionCount"] == li.MARKET_LIVE_LISTING_COUNT + consumable_listings,
                 "hub did not combine synthetic + user active listing after one synthetic sale")
         require(owner_hub.get("tradePileCount") == 1 and owner_hub.get("selling") == 1 and owner_hub.get("sold") == 0,
                 f"hub owner transfer-list counters are wrong: {owner_hub}")
@@ -155,6 +163,76 @@ def main() -> int:
             require(row is None, "clearing sold resurrected the sold item")
             trend = con.execute("SELECT pressure,total_buys,total_sales FROM market_trends WHERE resource_id=20801").fetchone()
             require(trend is not None and trend[1] >= 1 and trend[2] >= 1, f"supply/demand trend counters not persisted: {trend}")
+
+        # Rotating stock. Restore the configured fraction: from here on the point
+        # is that only part of the catalogue is listed at a time.
+        li.MARKET_ROTATION_FRACTION = rotation_fraction
+        li.LocalIdentityStore._market_rotation_count_cache = None
+        require(rotation_fraction >= 1, f"rotation fraction must be at least 1: {rotation_fraction}")
+        rotation = li._market_rotation_index(1_786_383_600)
+        live = [
+            p for p in li.MARKET_PLAYER_CATALOG
+            if li._market_card_in_rotation(int(p.get("resourceId", p.get("assetId", 0)) or 0), rotation)
+        ]
+        if rotation_fraction > 1:
+            share = len(live) / len(li.MARKET_PLAYER_CATALOG)
+            expected = 1 / rotation_fraction
+            require(abs(share - expected) < expected * 0.25,
+                    f"rotation stocks {share:.3f} of the catalogue, expected about {expected:.3f}")
+            later = li._market_rotation_index(1_786_383_600 + li.MARKET_ROTATION_SECONDS * 3)
+            rotated = [
+                p for p in li.MARKET_PLAYER_CATALOG
+                if li._market_card_in_rotation(int(p.get("resourceId", p.get("assetId", 0)) or 0), later)
+            ]
+            require({id(p) for p in live} != {id(p) for p in rotated}, "stock never rotates")
+        # A rotation has to be stable: paging a search must not reshuffle it.
+        for player in li.MARKET_PLAYER_CATALOG[:200]:
+            resource = int(player.get("resourceId", player.get("assetId", 0)) or 0)
+            require(li._market_card_in_rotation(resource, rotation) ==
+                    li._market_card_in_rotation(resource, rotation),
+                    f"rotation membership is not deterministic for {resource}")
+        market_now = store.market_search({"start": ["0"], "num": ["10"]})
+        require(int(market_now["total"]) == store._market_rotation_listing_count(int(__import__("time").time())),
+                "search total does not match the rotation's listing count")
+
+        # Consumables: every kind, always in stock, one flat price, and buying one
+        # puts a usable item in the club.
+        for token in ("training", "development", "consumables"):
+            page = store.market_search({"type": [token], "start": ["0"], "num": ["20"]})
+            listings = page.get("auctionInfo", [])
+            require(listings, f"no consumables listed for type={token}")
+            require(all(int(a["buyNowPrice"]) == li.MARKET_CONSUMABLE_BUY_NOW for a in listings),
+                    f"type={token} consumables are not all {li.MARKET_CONSUMABLE_BUY_NOW} coins")
+            require(len({int(a["itemData"]["resourceId"]) for a in listings}) == len(listings),
+                    f"type={token} first page repeats the same consumable instead of showing variety")
+        every = store.market_search({"type": ["consumables"], "start": ["0"], "num": ["100"]})
+        require(int(every["total"]) == len(li.MARKET_CONSUMABLE_CATALOG) * li.MARKET_CONSUMABLE_COPIES,
+                f"consumable stock is incomplete: {every['total']}")
+        # Every catalogue row is listed, so ask the catalogue rather than one page.
+        categories = {
+            li.LocalIdentityStore._consumable_filter_category(row)
+            for row in li.MARKET_CONSUMABLE_CATALOG
+        }
+        for family in ("position", "playstyle", "contract", "fitness", "healing", "training"):
+            require(family in categories, f"{family} consumables are not on the market: {sorted(categories)}")
+        store.ensure_local_test_balance()
+        chem = next(a for a in every["auctionInfo"]
+                    if li.LocalIdentityStore._consumable_filter_category(
+                        li.CONSUMABLE_BY_RESOURCE[int(a["itemData"]["resourceId"])]) == "playstyle")
+        coins_before = store.currencies()["credits"]
+        won = store.market_bid(int(chem["tradeId"]), li.MARKET_CONSUMABLE_BUY_NOW)
+        require(won.get("tradeState") == "closed", f"consumable Buy Now did not close: {won}")
+        require(store.currencies()["credits"] == coins_before - li.MARKET_CONSUMABLE_BUY_NOW,
+                "consumable purchase debited the wrong amount")
+        consumable_id = int(won["itemData"]["id"])
+        require(any(int(x.get("id", 0)) == consumable_id for x in store.purchased_items().get("itemData", [])),
+                "bought consumable is missing from New Items")
+        assigned = store.move_items([{"id": consumable_id, "pile": 7}])
+        require(assigned["itemData"][0]["success"] is True, f"bought consumable could not be assigned: {assigned}")
+        require(int(store.consumable_stats().get("consumables", 0)) >= 1,
+                "bought consumable is not counted by the retail apply dialogs")
+        cheap = store.market_bid(int(chem["tradeId"]), li.MARKET_CONSUMABLE_BUY_NOW - 1)
+        require(cheap.get("tradeState") != "closed", "a bid under the flat price still bought the consumable")
 
         # Pack-weight contract remains untouched: lenient specials, hard max 2.
         definition = li.PACK_DEFINITIONS[105]
