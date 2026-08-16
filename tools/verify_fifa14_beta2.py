@@ -228,8 +228,20 @@ def main() -> int:
 
         seasons = store.offline_seasons_list()
         season_rows = seasons.get("seasons", [])
-        if len(season_rows) != 10:
-            fail(f"offline seasons must expose ten native division records: {seasons}")
+        # The ladder length is local tuning, not a client contract. What the
+        # client does pin down is which division it asks for: the 2026-08-15
+        # capture requested divisionList=11, and returning a ladder without it
+        # is what produced "seasons are currently unavailable". Assert the
+        # ladder is contiguous, descending, and contains the entry division.
+        ladder = [int(row["divisionId"]) for row in season_rows]
+        if ladder != sorted(ladder, reverse=True) or len(set(ladder)) != len(ladder):
+            fail(f"season divisions must descend without repeats: {ladder}")
+        if ladder != list(range(ladder[0], ladder[0] - len(ladder), -1)):
+            fail(f"season divisions must be contiguous so promotion has somewhere to go: {ladder}")
+        if ladder[0] != store.entry_season_division():
+            fail(f"the ladder must start at the entry division {store.entry_season_division()}: {ladder}")
+        if [int(row["id"]) for row in season_rows] != list(range(1, len(season_rows) + 1)):
+            fail(f"season list ids must be 1-based and in order: {[r['id'] for r in season_rows]}")
         first = season_rows[0]
         required_season = {
             "id", "type", "divisionId", "numMatches", "matchLengthMin", "matches",
@@ -238,7 +250,7 @@ def main() -> int:
             "untilStartSeconds", "untilEndSeconds",
         }
         if not required_season.issubset(first):
-            fail(f"Division 10 native season record is incomplete: {first}")
+            fail(f"entry-division native season record is incomplete: {first}")
         guessed_season_keys = {
             "seasonId", "division", "name", "matchesPlayed", "matchesToPlay",
             "pointsToWinTitle", "pointsToPromote", "pointsToAvoidRelegation",
@@ -246,8 +258,8 @@ def main() -> int:
         }
         if guessed_season_keys.intersection(first):
             fail(f"legacy guessed season keys leaked back onto the wire: {first}")
-        if int(first["id"]) != 1 or first["type"] != "OFFLINE" or int(first["divisionId"]) != 10:
-            fail(f"first native season record must map ID 1 to Division 10 OFFLINE: {first}")
+        if int(first["id"]) != 1 or first["type"] != "OFFLINE":
+            fail(f"first native season record must map ID 1 to an OFFLINE season: {first}")
         if int(first.get("trophyResourceId", 0)) != -1:
             fail(f"BETA 2.22 season no-trophy sentinel must be -1: {first}")
         matches = first.get("matches")
@@ -266,16 +278,39 @@ def main() -> int:
             "RELEGATION", "MAINTENANCE", "PROMOTION", "CHAMPIONSHIP"
         ]:
             fail(f"Division 10 prizeSet enum/order is wrong: {prizes}")
+        # Division 10's thresholds are known from the retail frontend (12/9/0),
+        # so check that division specifically rather than whichever record now
+        # happens to be first -- the ladder starts at the entry division.
+        division_ten = next((row for row in season_rows if int(row["divisionId"]) == 10), None)
+        if division_ten is None:
+            fail(f"the ladder no longer contains Division 10: {ladder}")
+        ten_thresholds = {
+            p["prizeLevel"]: int(p.get("thresholdPoint", -1)) for p in division_ten["prizeSet"]
+        }
+        if ten_thresholds != {"RELEGATION": 0, "MAINTENANCE": 0, "PROMOTION": 9, "CHAMPIONSHIP": 12}:
+            fail(f"Division 10 native thresholds are wrong: {ten_thresholds}")
         thresholds = {p["prizeLevel"]: int(p.get("thresholdPoint", -1)) for p in prizes}
-        if thresholds != {"RELEGATION": 0, "MAINTENANCE": 0, "PROMOTION": 9, "CHAMPIONSHIP": 12}:
-            fail(f"Division 10 native thresholds are wrong: {thresholds}")
+        if not (thresholds["CHAMPIONSHIP"] > thresholds["PROMOTION"] > thresholds["RELEGATION"] - 1):
+            fail(f"entry-division thresholds are not ordered: {thresholds}")
         for prize in prizes:
             mappings = prize.get("awardMappings")
             if not isinstance(mappings, list) or not mappings or not isinstance(mappings[0].get("awards"), list):
                 fail(f"season awardMappings must be array -> awards array: {prize}")
         season_user = store.offline_season_user()
-        if season_user != {"seasonId": 1, "divisionId": 10, "round": 1}:
-            fail(f"fresh parser-native offline season progress must use one-based wire round 1: {season_user}")
+        # season/user and season/list have to agree on the division, because the
+        # client asks the list for the division it believes it is in. Them
+        # drifting apart is exactly what left the screen with nothing to show.
+        if season_user != {"seasonId": 1, "divisionId": store.entry_season_division(), "round": 1}:
+            fail(f"fresh offline season progress must point at the entry division, round 1: {season_user}")
+        if int(season_rows[int(season_user["seasonId"]) - 1]["divisionId"]) != int(season_user["divisionId"]):
+            fail(f"season/user seasonId does not select its own division in the list: {season_user}")
+        # The screen names the divisions it wants; serve those.
+        asked = store.offline_seasons_list({"divisionList": [str(store.entry_season_division())]})
+        if [int(r["divisionId"]) for r in asked["seasons"]] != [store.entry_season_division()]:
+            fail(f"a divisionList filter must be honoured: {[r['divisionId'] for r in asked['seasons']]}")
+        unknown = store.offline_seasons_list({"divisionList": ["99"]})
+        if len(unknown["seasons"]) != len(season_rows):
+            fail("an unknown division must fall back to the whole ladder, not an empty list")
 
         # BETA 2.22 keeps the proven native PC tournament schema but exposes
         # four independent knockout cups. `rounds` remains an ARRAY; names are
@@ -848,6 +883,14 @@ def main() -> int:
             fail(f"reset left extra squads behind: {[s['squadName'] for s in reset_squads]}")
         if reset_store.offline_tournament_user_list().get("tournamentId") != []:
             fail("reset left a cup advertised as underway")
+        # A fresh club reads 0-0-0. The hub derives the record from settled match
+        # sessions, so leaving those behind gave a brand-new club somebody else's
+        # results (dzevallos/f14-localfut#7).
+        if reset_store.match_record() != {"wins": 0, "draws": 0, "losses": 0}:
+            fail(f"a cleared club must have no W-D-L record: {reset_store.match_record()}")
+        fut_user_after_reset = reset_store.ensure_fut_user()
+        if any(int(fut_user_after_reset.get(key, -1)) != 0 for key in ("wins", "draws", "losses")):
+            fail(f"/user still publishes a stale record after a club reset: {fut_user_after_reset}")
         if len(reset_store.create_match({"squadId": 0, "type": "OFFLINE"})["squad"]["players"]) != 23:
             fail("a reset club cannot start a match")
 

@@ -192,8 +192,16 @@ def main() -> int:
     common_script = ROOT / "tools" / "common.ps1"
     require(common_script, ("Get-LocalConfig", "Save-Fifa14Config", "FIFA14_GAME_ROOT", "Get-Fifa14AutoDetectCandidates", "PromptIfMissing", "PersistDetected"))
     require(ROOT / "config.local.psd1.example", ("GameRoot", "GameExe"))
-    if "config.local.psd1" not in (ROOT / ".gitignore").read_text(encoding="utf-8", errors="replace"):
-        raise RuntimeError("config.local.psd1 must be ignored by Git")
+    # Repo hygiene, and only meaningful in a repo. A release package has no
+    # .gitignore -- the packager strips it deliberately -- and reading it
+    # unconditionally made every extracted release fail this verifier, which the
+    # launcher turns into "BETA FAILED" before the server ever starts
+    # (dzevallos/f14-localfut#1). Check it where it applies; skip it where it
+    # cannot.
+    gitignore = ROOT / ".gitignore"
+    if gitignore.is_file():
+        if "config.local.psd1" not in gitignore.read_text(encoding="utf-8", errors="replace"):
+            raise RuntimeError("config.local.psd1 must be ignored by Git")
     patcher_test = subprocess.run([sys.executable, str(legend_db_patcher), "--self-test"],
                                   capture_output=True, text=True, check=False)
     if patcher_test.returncode != 0:

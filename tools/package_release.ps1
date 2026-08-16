@@ -4,6 +4,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$VenvPython = Join-Path $Root ".venv\Scripts\python.exe"
+$PythonExe = if (Test-Path -LiteralPath $VenvPython) { $VenvPython } else { "python" }
 $Dist = Join-Path $Root "dist"
 $SafeVersion = ($Version -replace '[^A-Za-z0-9._-]', '-')
 $Name = "FIFA-14-Local-FUT-$SafeVersion"
@@ -86,6 +88,39 @@ try {
     foreach ($compiled in @("*.pyc", "*.pyo")) {
         Get-ChildItem -LiteralPath $StageRoot -Recurse -Force -File -Filter $compiled |
             ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force }
+    }
+
+    # Verify the package, not the working folder. A release is a *different tree*
+    # from the repo -- no .gitignore, no .git, no artifacts -- and 0.2-beta
+    # shipped unable to start because a verifier read a file the packager strips
+    # (dzevallos/f14-localfut#1). The launcher runs these before startup, so if
+    # they fail here they would fail for everyone who downloads this.
+    $StagedVerifiers = @(
+        "verify_fifa14_v237_install.py",
+        "verify_fifa14_beta2.py"
+    )
+    foreach ($verifier in $StagedVerifiers) {
+        $verifierPath = Join-Path $StageRoot "tools\$verifier"
+        if (-not (Test-Path -LiteralPath $verifierPath)) { continue }
+        Write-Host "[check] $verifier against the staged package..."
+        # Windows PowerShell 5.1 turns *any* native stderr line into a
+        # NativeCommandError, which $ErrorActionPreference = "Stop" then treats
+        # as fatal even when the process exits 0 -- and these verifiers write
+        # ordinary diagnostics to stderr. Relax the preference across the call
+        # and trust the exit code, which is the only reliable signal here.
+        $previousPreference = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            & $PythonExe $verifierPath *> $null
+            $verifierExit = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousPreference
+        }
+        if ($verifierExit -ne 0) {
+            throw ("Refusing to package: $verifier fails inside the release tree, " +
+                   "so the launcher would refuse to start for anyone who downloads it. " +
+                   "Re-run it directly to see why: python tools\$verifier")
+        }
     }
 
     if (Test-Path -LiteralPath $ZipPath) {
