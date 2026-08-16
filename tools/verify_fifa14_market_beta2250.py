@@ -195,6 +195,32 @@ def main() -> int:
         require(int(market_now["total"]) == store._market_rotation_listing_count(int(__import__("time").time())),
                 "search total does not match the rotation's listing count")
 
+        # Listings are shuffled per rotation rather than sorted by rating, which
+        # otherwise opens every page with the best cards in the game, three
+        # copies at a time (dzevallos/f14-localfut#5). The shuffle must not cost
+        # paging stability: the client pages with start/num and would show
+        # duplicates or skip cards if the order moved between requests.
+        first = [a["tradeId"] for a in store.market_search({"start": ["0"], "num": ["12"]})["auctionInfo"]]
+        second = [a["tradeId"] for a in store.market_search({"start": ["12"], "num": ["12"]})["auctionInfo"]]
+        require(first == [a["tradeId"] for a in store.market_search({"start": ["0"], "num": ["12"]})["auctionInfo"]],
+                "repeating the same market page returned a different page")
+        require(not set(first).intersection(second), "market paging repeats listings across pages")
+        ratings = [int(a["itemData"]["rating"]) for a in
+                   store.market_search({"start": ["0"], "num": ["40"]})["auctionInfo"]]
+        require(ratings != sorted(ratings, reverse=True),
+                "market results are still ordered by rating, which reads as a leaderboard")
+        require(max(ratings) - min(ratings) > 10,
+                f"market page lacks a spread of ratings: {min(ratings)}-{max(ratings)}")
+        # The search screen sends compound positions, captured as pos=CAM-CF.
+        # Comparing that as a single literal matched nothing at all.
+        compound = store.market_search({"type": ["player"], "pos": ["CAM-CF"], "num": ["20"]})
+        require(int(compound["total"]) > 0, "a compound position search returned nothing")
+        require({a["itemData"]["preferredPosition"] for a in compound["auctionInfo"]} <= {"CAM", "CF"},
+                "a compound position search returned cards outside the requested positions")
+        single = store.market_search({"type": ["player"], "pos": ["CB"], "num": ["20"]})
+        require({a["itemData"]["preferredPosition"] for a in single["auctionInfo"]} == {"CB"},
+                "a single position search is no longer exact")
+
         # Consumables: every kind, always in stock, one flat price, and buying one
         # puts a usable item in the club.
         for token in ("training", "development", "consumables"):

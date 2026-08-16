@@ -166,6 +166,21 @@ def _market_rotation_index(now: int) -> int:
     return int(now) // max(1, MARKET_ROTATION_SECONDS)
 
 
+def _market_listing_order(resource_id: int, copy_index: int, rotation: int) -> int:
+    """A stable shuffle key for one listing within one rotation.
+
+    Sorting by rating made every page open with the best cards in the game, three
+    copies at a time, which reads as a leaderboard rather than a market
+    (dzevallos/f14-localfut#5). Ordering by a hash instead mixes the ratings and
+    separates copies of the same card, while staying identical for the whole
+    rotation so paging cannot shuffle underneath the client.
+    """
+    digest = hashlib.blake2b(
+        f"{int(rotation)}:{int(resource_id)}:{int(copy_index)}".encode("ascii"), digest_size=8
+    ).digest()
+    return int.from_bytes(digest, "big")
+
+
 def _market_card_in_rotation(resource_id: int, rotation: int) -> bool:
     """Is this card part of the given rotation's stock?
 
@@ -4506,7 +4521,11 @@ class LocalIdentityStore:
             return self.empty_auctions()
         definition = self._market_int(query, "definitionId", "maskedDefId")
         level = self._market_first(query, "lev", "level", default="any").lower()
+        # The search screen sends compound positions, captured as `pos=CAM-CF`
+        # for the attacking-midfield group. Comparing that as one literal string
+        # matched no card, so those searches returned nothing at all.
         position = self._market_first(query, "pos", "position", default="").upper()
+        positions = {part for part in re.split(r"[-,|]", position) if part} - {"ANY", "-1", ""}
         nation = self._market_int(query, "nat", "nation", default=-1)
         league = self._market_int(query, "leag", "league", default=-1)
         team = self._market_int(query, "team", "club", default=-1)
@@ -4559,7 +4578,7 @@ class LocalIdentityStore:
                     continue
                 if rare_filter in {"sp","special"} and not special:
                     continue
-            if position not in {"", "ANY", "-1"} and str(player.get("position", "")).upper() != position:
+            if positions and str(player.get("position", "")).upper() not in positions:
                 continue
             if nation not in (None, -1, 0) and int(player.get("nation", -999)) != int(nation):
                 continue
@@ -4583,7 +4602,9 @@ class LocalIdentityStore:
                     continue
                 refs.append((player, copy_index, price, starting))
 
-        refs.sort(key=lambda ref: (-int(ref[0].get("rating", 0)), ref[2], str(ref[0].get("name", "")), ref[1]))
+        refs.sort(key=lambda ref: _market_listing_order(
+            int(ref[0].get("resourceId", ref[0].get("assetId", 0)) or 0), ref[1], rotation
+        ))
         total = len(refs)
         page = refs[start:start + count]
         auctions = [
