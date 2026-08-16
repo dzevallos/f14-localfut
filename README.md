@@ -1,4 +1,4 @@
-# FIFA 14 Local FUT - adjusted fork
+# FIFA 14 Local FUT — adjusted fork
 
 A fork of **[KyroGeorge2/FIFA-14-Local-FUT](https://github.com/KyroGeorge2/FIFA-14-Local-FUT)**
 (BETA 2.25.9), with squad, tournament, market and economy work on top. Everything here
@@ -18,9 +18,12 @@ Each one names the diagnostic that would settle it.
 | Resuming an "underway" cup | **Fixed** — used to crash the client |
 | "Leaving Ultimate Team" hang | **Fixed** |
 | Cup opponents and difficulty | **Reworked** — tiered per cup |
-| Transfer market | **Reworked** — rotating stock, consumables always in stock |
+| Transfer market | **Reworked** — rotating stock, consumables always in stock, ordered by time remaining |
 | Match / cup payouts | **Configurable**, no code editing |
-| Offline Seasons | **Broken** — never worked; one fix armed, unconfirmed |
+| Offline Seasons | **Reworked** — eleven tiered divisions, progress saves, promotion and relegation. Opens and plays; the ladder needs one full season to confirm |
+| Player card stats | **Fixed** — goals, assists, cards and appearances accumulate per card |
+| Frame rate during a match | **Fixed** — a diagnostic hook was rebuilding a full stack trace for every debug line the game printed |
+| Club venue | **Configurable** — defaults to Forest Park |
 | Match length | Label only — gameplay ignores it |
 | "DB ERROR" card in packs | Open — client-side catalogue gap |
 | Store pack names/descriptions | Open — cosmetic |
@@ -66,6 +69,31 @@ been played.
 reference, so once that row existed it never granted again. It is now a top-up to a
 target: a no-op at or above it, restores it below.
 
+**Offline Seasons threw your progress away.** The client saves its season itself, before
+and after every fixture, with a `PUT` the server answered by handing back the season
+*list* — so the save was parsed as a list request and discarded, while `season/user`
+replied from a seeded row nothing ever updated. It reported season 2 / division 10
+against a list holding only season 1 / division 11: nothing matched, nothing was ever
+underway. Progress now round-trips, and the ladder is eleven divisions with its own ten
+opponents each, ~60 average rating at the bottom climbing to the actual top ten — every
+division used to schedule the same ten European giants against a bronze starter squad.
+
+**Player cards never recorded anything.** Goals and assists arrived with every match
+result and were written to a member the client does not read, and appearances were not
+counted at all, so every card sat on zero forever. They now accumulate into the two
+arrays the client actually parses, for the eleven that started, once per match.
+
+**Frame rate dropped during matches.** Windows raises an exception for every
+`OutputDebugString`, and the crash tracer was building a 32-frame stack trace with a
+module lookup per frame for each one — including a joystick the game does not recognise
+warning about itself every frame. One tester capture logged 1,000 of those in 38
+seconds and a 6-minute match that took 26 minutes of wall clock.
+
+**Two Transfer Market tabs were always empty.** Player Training and Manager Leagues sent
+their own spelling of the category and it was compared against the catalogue's spelling
+without normalising either — so 63 and 24 cards respectively were in stock and
+unreachable, while the three tabs whose spellings happened to match worked fine.
+
 ## What has been added
 
 **Settings editor — `FUT_SETTINGS.cmd`.** Match rewards (win / draw / loss / dnf), cup
@@ -104,13 +132,20 @@ it is what identified the cup crash above, in the client's own words.
 
 ## Open — testing would help
 
-**Offline Seasons kicks back to the FUT menu.** It has never worked. A note in the code
-records the screen asking for `/fut/items/pc/0.json` once per division and then
-abandoning: the season prize awards declared `assetId: 0`, so the client tried to
-resolve award item 0, its own no-item sentinel. They now use the cup ladder's proven
-award shape instead. `FIFA14_SEASON_AWARD_MODE=legacy` restores the old form for an
-A/B in one sitting. In the capture, `fut-season-request-beta2260` absent means the
-screen never even asks — a different hunt entirely.
+**Does the season ladder actually climb?** Seasons now open, play and save, and the
+server settles promotion and relegation itself. What is unconfirmed is who owns the
+division number: the client has its own `GetUsersOfflineDivision` and asks the season
+list for a specific division, and whether it adopts the one `season/user` reports has
+never been observed. Play a division-11 season to the end and check whether the next
+`season/list` request asks for division 10. `fut-season-request-beta2260` logs the
+divisions served next to the club's actual division on every request.
+If the screen breaks on a restored save, `FIFA14_SEASON_SAVE_MODE=round` falls back to
+the three members known to parse, without losing the save.
+
+**Which stat is in which slot on a player card?** Goals and appearances now accumulate,
+but each card carries five unlabelled stat slots and the order is inferred, not
+recorded. `FIFA14_PLAYER_STAT_PROBE=1` serves 11/22/33/44/55 in slots 0-4, so one look
+at a card detail screen decodes it. Read-only: your real totals are untouched.
 
 **Does round difficulty reach the AI, or is it only a label?** Match length is
 label-only — gameplay reads the client's own settings — so difficulty may be too. The

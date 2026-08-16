@@ -192,8 +192,22 @@ def main() -> int:
                     li._market_card_in_rotation(resource, rotation),
                     f"rotation membership is not deterministic for {resource}")
         market_now = store.market_search({"start": ["0"], "num": ["10"]})
-        require(int(market_now["total"]) == store._market_rotation_listing_count(int(__import__("time").time())),
-                "search total does not match the rotation's listing count")
+        # A card bought earlier in this run is withheld for
+        # MARKET_SYNTHETIC_RELIST_SECONDS, so the rotation's listing count is the
+        # ceiling and recent sales come off it. Comparing the two raw numbers only
+        # held while the Buy Now above happened to take a card the rotation was
+        # not listing anyway -- which stopped being true the moment listings were
+        # ordered by expiry and page one changed (#13).
+        clock = int(__import__("time").time())
+        with store._lock, closing(store._connect()) as probe_connection:
+            withheld = int(probe_connection.execute(
+                "SELECT COUNT(*) FROM market_synthetic_sales WHERE sold_at>=?",
+                (clock - li.MARKET_SYNTHETIC_RELIST_SECONDS,),
+            ).fetchone()[0])
+        expected_total = store._market_rotation_listing_count(clock) - withheld
+        require(int(market_now["total"]) == expected_total,
+                f"search total {market_now['total']} is not the rotation's "
+                f"{store._market_rotation_listing_count(clock)} less {withheld} recent sale(s)")
 
         # Listings are shuffled per rotation rather than sorted by rating, which
         # otherwise opens every page with the best cards in the game, three
@@ -241,6 +255,66 @@ def main() -> int:
         }
         for family in ("position", "playstyle", "contract", "fitness", "healing", "training"):
             require(family in categories, f"{family} consumables are not on the market: {sorted(categories)}")
+        # BETA 2.26.1 (dzevallos/f14-localfut#11): the tab sends its own spelling
+        # of the category, and it has to reach the same normalizer the catalogue
+        # name goes through. The counts below are the 2026-08-16 capture's own
+        # numbers -- the three that already worked, plus the two that served
+        # nothing because only one side of the comparison was normalized.
+        for token, expected in (
+            ("GKTraining", 63), ("position", 60), ("playStyle", 57),
+            ("playerTraining", 63), ("managerLeagueModifier", 24),
+        ):
+            page = store.market_search({"type": ["training"], "start": ["0"], "num": ["12"], "cat": [token]})
+            require(int(page.get("total", 0)) == expected,
+                    f"market cat={token} served {page.get('total')} of {expected} expected consumables")
+        for token, expected in (("contract", 39), ("fitness", 18), ("healing", 63)):
+            page = store.market_search({"type": ["development"], "start": ["0"], "num": ["12"], "cat": [token]})
+            require(int(page.get("total", 0)) == expected,
+                    f"market cat={token} served {page.get('total')} of {expected} expected consumables")
+        unknown = store.market_search({"type": ["training"], "start": ["0"], "num": ["12"], "cat": ["kit"]})
+        require(int(unknown.get("total", 0)) == 0,
+                "a category we do not stock must stay empty rather than fall back to everything")
+
+        # BETA 2.26.1 (dzevallos/f14-localfut#13): closest to expiry first, and
+        # the countdown is real. The order has to hold still for the rotation --
+        # a per-second cycle re-sorted the head of the market every second, which
+        # is worse than the shuffle it replaced -- while the numbers still tick.
+        # Pin the clock to just after a rotation boundary. Sampling twice against
+        # the wall clock fails whenever the second sample lands in the next
+        # rotation, and a verifier that fails one run in fifteen stops the game
+        # booting rather than reporting anything.
+        real_time = li.time.time
+        rotation_start = (int(real_time()) // li.MARKET_ROTATION_SECONDS) * li.MARKET_ROTATION_SECONDS
+        pinned = rotation_start + 60
+        try:
+            li.time.time = lambda: pinned
+            first = store.market_search({"type": ["player"], "start": ["0"], "num": ["20"]})
+        finally:
+            li.time.time = real_time
+        expiries = [int(a["expires"]) for a in first["auctionInfo"]]
+        require(expiries == sorted(expiries), f"market page is not ordered by time remaining: {expiries}")
+        require(len(set(expiries)) > 1, f"every listing shows the same time remaining: {expiries}")
+        require(all(int(a["expires"]) == int(a["EXPIRE_TIME"]) == int(a["expireTime"])
+                    for a in first["auctionInfo"]),
+                "the three expiry members disagree")
+        try:
+            li.time.time = lambda: pinned
+            second = store.market_search({"type": ["player"], "start": ["20"], "num": ["20"]})
+            gold = store.market_search({"type": ["player"], "lev": ["gold"], "start": ["0"], "num": ["12"]})
+            li.time.time = lambda: pinned + 120
+            later = store.market_search({"type": ["player"], "start": ["0"], "num": ["20"]})
+        finally:
+            li.time.time = real_time
+        following = [int(a["expires"]) for a in second["auctionInfo"]]
+        require(following == sorted(following) and following[0] >= expiries[-1],
+                f"paging breaks the expiry order: {expiries[-1]} then {following[0]}")
+        gold_expiries = [int(a["expires"]) for a in gold["auctionInfo"]]
+        require(gold_expiries == sorted(gold_expiries),
+                f"a filtered tab is not ordered by time remaining: {gold_expiries}")
+        require([a["tradeId"] for a in later["auctionInfo"]] == [a["tradeId"] for a in first["auctionInfo"]],
+                "the market re-sorted underneath the client inside one rotation")
+        require(all(before - int(a["expires"]) == 120 for before, a in zip(expiries, later["auctionInfo"])),
+                "the expiry countdown does not tick down with the clock")
         store.ensure_local_test_balance()
         chem = next(a for a in every["auctionInfo"]
                     if li.LocalIdentityStore._consumable_filter_category(

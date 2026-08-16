@@ -17,7 +17,10 @@ from local_identity import (
     LocalIdentityStore,
     PLAYER_CATALOG,
     PLAYER_BY_ASSET,
+    PLAYER_CARD_STAT_INDEX,
     PLAYER_ITEM_TYPE,
+    PLAYER_STAT_COUNT,
+    PLAYER_STAT_MAX,
     _diagnostic,
 )
 
@@ -29,14 +32,49 @@ DEFAULT_STARTER_BADGE_ID = 241
 # Keep the venue as backend state until the retail client tells us its exact
 # stadium-item contract. The match bootstrap can safely fall back to a known
 # retail venue name without fabricating an unknown item resource.
-DEFAULT_STARTER_STADIUM_NAME = "Town Park"
+DEFAULT_STARTER_STADIUM_NAME = "Forest Park"
+# The venue is one decision but it used to be spelled out in four places: this
+# module, the Frida agent's LOCAL_OFFLINE_STADIUM_ID (which forces it onto the
+# client's native offline stadium provider), the asset scanner, and the verifier.
+# `club.stadiumId` / `club.stadiumName` in the settings file now overrides both
+# halves in one edit, and `tools/print_stadium_default.py` is what the tracer
+# reads so the two can never drift apart again.
+#
+# The id is what the client renders; the name is only the label this server
+# reports. They are not derivable from each other -- stadium names are NOT in
+# the install as plain text (searching every file for "Town Park", a name this
+# build already uses, finds nothing), so the id/name pairing is external
+# knowledge and changing one does not change the other.
 # BETA 2.22 keeps match-facing kit/resource IDs resolved from the user's installed
 # FIFA databases before the backend starts. Previous betas fabricated 90M
 # resource IDs, which the retail client could parse as ItemData but could not
 # resolve to real textures.  The synthetic *owned item IDs* remain local-only;
 # their asset/resource/team fields now come from the retail DB scan.
 STARTER_COSMETIC_ITEM_BASE = 191_000_000_000
-DEFAULT_STARTER_STADIUM_ID = 34
+# Forest Park. Recovered from the maintainer's own save on 2026-08-16: the club
+# had Forest Park equipped and its activeStadium item was id 26 / carddbid
+# 6200010, rating 64 (a FUT generic ground, same tier as Town Park's 64). That
+# also settles what the `name` we serve is worth -- the save labels that item
+# "Stadium 26", the generated placeholder, while the game shows "Forest Park",
+# so the client renders stadium names from its own localization and our name
+# field is a server-side label only.
+DEFAULT_STARTER_STADIUM_ID = 26
+# The id whose row is spelled out in `_resolved_match_assets`. Anything else has
+# to be looked up in the shipped catalogue so its carddbid comes with it.
+_BUILT_IN_STADIUM_ID = 26
+
+
+def _apply_club_venue_settings() -> None:
+    """Overlay `club.stadiumId` / `club.stadiumName` onto the built-in venue."""
+    global DEFAULT_STARTER_STADIUM_ID, DEFAULT_STARTER_STADIUM_NAME
+    club = load_local_settings().get("club") or {}
+    if club.get("stadiumId"):
+        DEFAULT_STARTER_STADIUM_ID = int(club["stadiumId"])
+    if club.get("stadiumName"):
+        DEFAULT_STARTER_STADIUM_NAME = str(club["stadiumName"])
+
+
+_apply_club_venue_settings()
 MATCH_ASSET_REPORT = Path(__file__).resolve().parent.parent / "artifacts" / "fifa14-match-assets-v2411-beta222.json"
 
 
@@ -55,9 +93,14 @@ def _resolved_match_assets() -> dict[str, Any]:
         "awayKit": {"assetId": 15, "resourceId": 6400000, "definitionId": 6400000, "teamid": 241,
                     "category": 3, "teamkittypetechid": 1, "carddbid": 6400000, "cardassetid": 35, "year": 0,
                     "value": 89, "weightrare": 10},
-        "stadium": {"assetId": DEFAULT_STARTER_STADIUM_ID, "resourceId": 6200016, "definitionId": 6200016,
-                    "category": 4, "teamid": 0, "stadiumid": DEFAULT_STARTER_STADIUM_ID,
-                    "carddbid": 6200016, "cardassetid": 36, "name": DEFAULT_STARTER_STADIUM_NAME,
+        # Forest Park's own row, read off a real save. An id and a resource id
+        # are not interchangeable -- pairing a different stadium id with this
+        # resource asks the client for a venue that does not exist -- so a
+        # configured `club.stadiumId` is resolved out of the shipped catalogue
+        # below instead of patched in here.
+        "stadium": {"assetId": 26, "resourceId": 6200010, "definitionId": 6200010,
+                    "category": 4, "teamid": 0, "stadiumid": 26,
+                    "carddbid": 6200010, "cardassetid": 36, "name": "Forest Park",
                     "value": 64, "weightrare": 0},
     }
     try:
@@ -72,9 +115,48 @@ def _resolved_match_assets() -> dict[str, Any]:
                 result[key] = dict(fallback[key])
             else:
                 merged = dict(fallback[key]); merged.update(result[key]); result[key] = merged
+        configured = _configured_stadium_row(document, result.get("stadium"))
+        if configured is not None:
+            result["stadium"] = configured
         return result
     except Exception:
         return fallback
+
+
+def _configured_stadium_row(
+    document: dict[str, Any], current: dict[str, Any] | None = None
+) -> dict[str, Any] | None:
+    """The shipped catalogue row for `club.stadiumId`, id and resource together.
+
+    Returns None when the row already in hand is the wanted venue, or when the id
+    is one the client does not ship -- an unknown id must never reach the client
+    as a half-real stadium.
+
+    The comparison is against the row that actually won, not against the built-in
+    literal: the launch-time asset scan writes its own `resolved.stadium` into
+    artifacts/, and that file overrides the literal. Checking the constant
+    instead let a stale artifact keep serving the old venue.
+    """
+    wanted = int(DEFAULT_STARTER_STADIUM_ID)
+    if isinstance(current, dict):
+        have = int(current.get("stadiumid", current.get("assetId", -1)) or -1)
+        if have == wanted:
+            return None
+    catalog = document.get("catalog") if isinstance(document, dict) else None
+    stadiums = catalog.get("stadiums") if isinstance(catalog, dict) else None
+    for row in stadiums if isinstance(stadiums, list) else []:
+        if not isinstance(row, dict):
+            continue
+        if int(row.get("stadiumid", row.get("assetId", -1)) or -1) != wanted:
+            continue
+        resolved = dict(row)
+        resolved["name"] = DEFAULT_STARTER_STADIUM_NAME
+        return resolved
+    _diagnostic(
+        f"club.stadiumId {wanted} is not in the client's shipped stadium catalogue; "
+        "keeping the built-in venue rather than serving one it cannot render"
+    )
+    return None
 
 
 def _resolved_cosmetic_catalog() -> dict[str, list[dict[str, Any]]]:
@@ -146,6 +228,18 @@ OFFLINE_SEASON_DIVISIONS = [
     (2, "World Tour", 10, 21, 7500),
     (1, "World Tour", 10, 23, 10000),
 ]
+
+# Points below which a season ends in relegation. Divisions 11 and 10 keep the
+# retail Division 10 contract exactly (`avoid relegation: 0`, recorded from the
+# retail frontend and pinned by verify_fifa14_beta2), so the bottom two rungs are
+# a safety net you cannot fall out of. From Division 9 up the drop is real.
+SEASON_RELEGATION_THRESHOLDS = {
+    11: 0, 10: 0, 9: 4, 8: 5, 7: 6, 6: 7, 5: 8, 4: 9, 3: 10, 2: 11, 1: 12,
+}
+# How long after the Seasons screen saves its state a new match still counts as
+# a season fixture. The captured gap is under a second (save, then kick off), so
+# this is only wide enough to survive a slow squad screen in between.
+SEASON_MATCH_SAVE_WINDOW_SECONDS = 900
 
 # Tournament BETA 2.2 froze after a guessed record containing `rounds: 4`.
 # The retail parser proves `rounds` is an ARRAY. BETA 2.6 uses only keys the
@@ -287,22 +381,107 @@ TOURNAMENT_TEAM_POOLS = {
 }
 
 
+# Per-division season opponents. Until BETA 2.26.1 every division played the
+# same ten European giants (OFFLINE_COMPETITION_TEAM_IDS), so the entry division
+# opened with Barcelona, Real Madrid and Bayern against a ~60-rated bronze
+# starter squad -- the ladder had tiers on paper and one tier in practice.
+#
+# Built by scratchpad/season_pools.py over the shipped catalogues: club strength
+# is the mean rating of its best eighteen players in PLAYER_CATALOG (the measure
+# the cup pools were tuned with), and a club is only eligible if the installed
+# client can render it -- it must own both a badge and a kit in the extracted
+# match assets (587 badges / 1,173 kits), and have at least sixteen players.
+# 419 clubs qualify, spanning 53.6 to 84.1. The ladder walks that range in even
+# strength steps from ~60 (the starter squad's own level) to the actual top ten.
+SEASON_TEAM_POOLS = {
+    11: (1934, 111705, 111822, 1936, 110747, 898, 1754, 111399, 2056, 111393),  # mean 60.0
+    10: (111091, 1797, 550, 300, 100805, 1925, 919, 112390, 874, 112224),       # mean 62.2
+    9: (254, 1473, 1474, 711, 89, 1832, 269, 571, 691, 64),                     # mean 64.4
+    8: (982, 1926, 1902, 62, 112218, 110, 88, 110062, 1807, 1796),              # mean 66.6
+    7: (110930, 110456, 1878, 111974, 453, 1838, 14, 226, 674, 110636),         # mean 68.8
+    6: (1952, 217, 206, 1837, 1799, 78, 1843, 246, 569, 1917),                  # mean 71.0
+    5: (189, 452, 10029, 1629, 54, 38, 1896, 15, 65, 247),                      # mean 73.2
+    4: (69, 23, 1035, 1806, 100767, 481, 315, 448, 219, 1960),                  # mean 75.4
+    3: (144, 175, 457, 13, 34, 100769, 7, 325, 48, 236),                        # mean 77.1
+    2: (52, 461, 234, 110374, 46, 47, 44, 9, 240, 1),                           # mean 78.7
+    # Messi (241), Ronaldo (243), Ribery (21), Aguero (10), Mata (5).
+    1: (18, 73, 22, 11, 45, 5, 243, 10, 21, 241),                               # mean 82.1
+}
+
+
+def _season_opponents(division: int) -> tuple[int, ...]:
+    """The opponent pool for a division, falling back to the elite ladder top."""
+    pool = SEASON_TEAM_POOLS.get(int(division))
+    if pool:
+        return pool
+    nearest = min(SEASON_TEAM_POOLS, key=lambda key: abs(key - int(division)))
+    return SEASON_TEAM_POOLS[nearest]
+
+
+def _season_difficulty(division: int, index: int) -> int:
+    """AI level for one scheduled fixture.
+
+    Same enum as the cup ladder (0 Beginner .. 5 Legendary) and the same caveat:
+    whether the client feeds it to the AI or only to the label is still
+    unconfirmed. Division 11 opens on Amateur and Division 1 sits on Legendary,
+    with the closing three fixtures of every season a step harder.
+    """
+    base = 1 + (11 - int(division)) * 4 // 10
+    return int(max(1, min(5, base + (1 if int(index) >= 7 else 0))))
+
+
 def _season_matches(division: int, match_count: int) -> list[dict[str, Any]]:
     # The exact retail match-record parser consumes teamId, difficulty,
     # rewardMult, roundId and coins.  season/user's wire round is 1-based and
     # decremented internally, while match roundId is stored directly; therefore
     # scheduled roundId values are 0..N-1.
-    base_difficulty = max(1, min(5, 1 + (10 - int(division)) // 2))
+    pool = _season_opponents(division)
     rows: list[dict[str, Any]] = []
     for index in range(max(0, int(match_count))):
         rows.append({
-            "teamId": int(OFFLINE_COMPETITION_TEAM_IDS[index % len(OFFLINE_COMPETITION_TEAM_IDS)]),
-            "difficulty": int(min(5, base_difficulty + (1 if index >= 7 else 0))),
+            "teamId": int(pool[index % len(pool)]),
+            "difficulty": _season_difficulty(division, index),
             "rewardMult": 1,
             "roundId": int(index),
-            "coins": int(250 + (10 - int(division)) * 25 + index * 10),
+            "coins": int(250 + (11 - int(division)) * 25 + index * 10),
         })
     return rows
+
+
+def _entry_season_division() -> int:
+    """The division a club with no season history starts in (bottom of the ladder)."""
+    return int(OFFLINE_SEASON_DIVISIONS[0][0])
+
+
+def _season_ladder_id(division: int) -> int:
+    """The 1-based season-list `id` that carries a division.
+
+    season/user's `seasonId` selects a record out of the list the screen just
+    fetched, so this mapping is the contract between the two documents.
+    """
+    for index, entry in enumerate(OFFLINE_SEASON_DIVISIONS, start=1):
+        if int(entry[0]) == int(division):
+            return index
+    return 1
+
+
+def _season_definition(division: int) -> tuple[int, str, int, int, int]:
+    """The ladder row for a division, falling back to the entry division."""
+    for entry in OFFLINE_SEASON_DIVISIONS:
+        if int(entry[0]) == int(division):
+            return entry
+    return OFFLINE_SEASON_DIVISIONS[0]
+
+
+def _season_next_division(division: int, outcome: str) -> int:
+    """Where the club plays next season. The ladder ends at 1 and at its entry."""
+    divisions = [int(entry[0]) for entry in OFFLINE_SEASON_DIVISIONS]
+    top, bottom = min(divisions), max(divisions)
+    if outcome in {"CHAMPIONSHIP", "PROMOTION"}:
+        return max(top, int(division) - 1)
+    if outcome == "RELEGATION":
+        return min(bottom, int(division) + 1)
+    return int(division)
 
 
 def _coin_award(value: int) -> dict[str, Any]:
@@ -344,7 +523,9 @@ def _native_season_record(index: int, division: int, matches: int, promote: int,
     # promote+3 progression, but crucially they now travel through the exact
     # native prizeSet schema rather than unrecognised top-level members.
     title_threshold = 12 if int(division) == 10 else min(30, int(promote) + 3)
-    maintenance_threshold = 0
+    # MAINTENANCE is "points to avoid relegation" on the season tile, and it is
+    # also the number the server settles against when the season ends.
+    maintenance_threshold = int(SEASON_RELEGATION_THRESHOLDS.get(int(division), 0))
     holding_coins = 300 if int(division) == 10 else max(300, int(championship_coins) // 5)
     promotion_coins = 1500 if int(division) == 10 else max(500, int(championship_coins) - 400)
     return {
@@ -556,6 +737,50 @@ class BetaIdentityStore(LocalIdentityStore):
                     updated_at INTEGER NOT NULL,
                     PRIMARY KEY(persona_id, tournament_id)
                 );
+                -- One row per club: the season it is in right now. The client
+                -- PUTs `{round, dataVersion, data, progressDataVersion,
+                -- progressData}` to /season/<id>/division/<div>/user before and
+                -- after every fixture (captured 2026-08-16); BETA 2.26 threw
+                -- that away and answered season/user from a stale seeded row, so
+                -- a played season never came back as underway. `season_data` is
+                -- the client's own opaque blob and is echoed back verbatim.
+                CREATE TABLE IF NOT EXISTS beta_season_progress (
+                    persona_id INTEGER PRIMARY KEY,
+                    season_id INTEGER NOT NULL,
+                    division INTEGER NOT NULL,
+                    round_value INTEGER NOT NULL DEFAULT 1,
+                    matches_played INTEGER NOT NULL DEFAULT 0,
+                    points INTEGER NOT NULL DEFAULT 0,
+                    won INTEGER NOT NULL DEFAULT 0,
+                    draw INTEGER NOT NULL DEFAULT 0,
+                    lost INTEGER NOT NULL DEFAULT 0,
+                    data_version INTEGER NOT NULL DEFAULT 1,
+                    season_data TEXT NOT NULL DEFAULT '',
+                    progress_data_version INTEGER NOT NULL DEFAULT 1,
+                    progress_data TEXT NOT NULL DEFAULT '',
+                    started_at INTEGER NOT NULL DEFAULT 0,
+                    -- Written *only* when the client saves its season, because
+                    -- that write is what marks the next match as a season
+                    -- fixture. Seeding or settling must not set it, or every
+                    -- friendly a new club plays counts towards its season.
+                    saved_at INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS beta_season_history (
+                    persona_id INTEGER NOT NULL,
+                    finished_at INTEGER NOT NULL,
+                    season_id INTEGER NOT NULL,
+                    division INTEGER NOT NULL,
+                    next_division INTEGER NOT NULL,
+                    matches_played INTEGER NOT NULL DEFAULT 0,
+                    points INTEGER NOT NULL DEFAULT 0,
+                    won INTEGER NOT NULL DEFAULT 0,
+                    draw INTEGER NOT NULL DEFAULT 0,
+                    lost INTEGER NOT NULL DEFAULT 0,
+                    outcome TEXT NOT NULL DEFAULT 'MAINTENANCE',
+                    coins INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(persona_id, finished_at, season_id)
+                );
                 """
             )
             identity = self._identity(connection)
@@ -581,6 +806,19 @@ class BetaIdentityStore(LocalIdentityStore):
                     VALUES (?,?,?,0,0,0,0,0,0,1,?)""",
                     (persona_id, int(season["seasonId"]), int(season["division"]), now),
                 )
+            # A club with no season row starts at the bottom of the ladder. Saves
+            # made before BETA 2.26.1 carry a beta_offline_seasons row for the old
+            # entry division 10; it is deliberately not migrated, because that
+            # table only ever held a tally and the drift between it and the served
+            # list is what reported season 2 / division 10 against a list holding
+            # only season 1 / division 11.
+            connection.execute(
+                """INSERT OR IGNORE INTO beta_season_progress
+                (persona_id,season_id,division,round_value,started_at,updated_at)
+                VALUES (?,?,?,1,?,?)""",
+                (persona_id, _season_ladder_id(_entry_season_division()),
+                 _entry_season_division(), now, now),
+            )
             for tournament in OFFLINE_TOURNAMENTS:
                 connection.execute(
                     """INSERT OR IGNORE INTO beta_offline_tournaments
@@ -956,11 +1194,51 @@ class BetaIdentityStore(LocalIdentityStore):
             states = ["activeHomeKit", "activeAwayKit", "activeStadium"]
             if include_badge:
                 states.append("activeBadge")
+            if found and "activeStadium" not in found:
+                # A club that has chosen kits but has no venue leaves the match
+                # bootstrap with nowhere to kick off. Fill that gap from the
+                # configured default rather than serving a short actives list.
+                #
+                # Deliberately only when something else is already active: a
+                # *fresh* club is supposed to have no active cosmetics at all
+                # until the retail client selects them, and verify_fifa14_beta2
+                # pins that. Fabricating one here would fake a choice the user
+                # has not made.
+                fallback = self._default_stadium_item_locked(connection, persona_id)
+                if fallback is not None:
+                    found["activeStadium"] = fallback
+                    _diagnostic(
+                        "club has active cosmetics but no stadium; falling back to "
+                        f"{DEFAULT_STARTER_STADIUM_NAME} (id {DEFAULT_STARTER_STADIUM_ID})"
+                    )
             return [
                 self._cosmetic_wire_payload(found[state])
                 for state in states
                 if state in found
             ]
+
+    def _default_stadium_item_locked(
+        self, connection: sqlite3.Connection, persona_id: int
+    ) -> dict[str, Any] | None:
+        """The club's copy of the configured default stadium, or any stadium it owns."""
+        rows = connection.execute(
+            "SELECT payload FROM items WHERE persona_id=? AND item_type='stadium' ORDER BY item_id",
+            (int(persona_id),),
+        ).fetchall()
+        first: dict[str, Any] | None = None
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if first is None:
+                first = payload
+            stadium_id = int(payload.get("stadiumid", payload.get("assetId", 0)) or 0)
+            if stadium_id == int(DEFAULT_STARTER_STADIUM_ID):
+                return payload
+        return first
 
     def static_cosmetic_resource(self, resource_id: int) -> dict[str, Any] | None:
         """Resolve owned cosmetics plus local tournament trophy metadata."""
@@ -1471,6 +1749,11 @@ class BetaIdentityStore(LocalIdentityStore):
                 ("DELETE FROM beta_match_sessions WHERE persona_id=?", (persona_id,)),
                 ("UPDATE beta_offline_seasons SET matches_played=0, points=0, won=0, draw=0, "
                  "lost=0, trophies_won=0 WHERE persona_id=?", (persona_id,)),
+                # A starter club goes back to the bottom of the season ladder with
+                # no saved fixtures: the stored blob belongs to a squad that is
+                # about to stop existing.
+                ("DELETE FROM beta_season_progress WHERE persona_id=?", (persona_id,)),
+                ("DELETE FROM beta_season_history WHERE persona_id=?", (persona_id,)),
                 # Dropping the club row is what makes ensure_beta_starter_club()
                 # take its fresh-profile path below.
                 ("DELETE FROM clubs WHERE persona_id=?", (persona_id,)),
@@ -1777,13 +2060,27 @@ class BetaIdentityStore(LocalIdentityStore):
                 "WHERE persona_id=? AND status='active' AND settled=0",
                 (now, persona_id),
             )
+            stored = dict(document)
+            season_division = self._pending_season_division_locked(connection, persona_id, document)
+            if season_division:
+                # A cup match names its tournament in the POST body; a season match
+                # does not name anything, so the marker is the season save the
+                # screen writes immediately before kickoff (captured 2026-08-16:
+                # PUT /season/1/division/11/user, then POST /match eight lines
+                # later). customData1 is logged because it may turn out to be a
+                # cleaner discriminator once a cup match is captured next to one.
+                stored["_seasonDivision"] = int(season_division)
+                _diagnostic(
+                    f"match created inside the division {season_division} offline season "
+                    f"(customData1={document.get('customData1')})"
+                )
             connection.execute(
                 """INSERT INTO beta_match_sessions (
                     match_id,persona_id,mode,difficulty,stadium_name,status,created_at,started_at,
                     reward_breakdown_json,raw_result_json,settled
                 ) VALUES (?,?,?,'unknown',?,'active',?,?, '{}',?,0)""",
                 (match_id, persona_id, mode, settings[0] if settings else DEFAULT_STARTER_STADIUM_NAME,
-                 now, now, json.dumps(document, separators=(",", ":"), sort_keys=True)),
+                 now, now, json.dumps(stored, separators=(",", ":"), sort_keys=True)),
             )
             self._counter_add_locked(connection, "matches_started", 1)
         squad = self.playable_squad_document()
@@ -2245,18 +2542,30 @@ class BetaIdentityStore(LocalIdentityStore):
                 if "contracts" in payload:
                     payload["contracts"] = contract_after
 
-            match_goals = 0
-            match_assists = 0
-            try:
-                match_goals = max(0, int(submitted.get("goals", 0) or 0))
-            except (TypeError, ValueError):
-                pass
-            try:
-                match_assists = max(0, int(submitted.get("assists", 0) or 0))
-            except (TypeError, ValueError):
-                pass
-            if match_goals:
-                payload["lifetimeGoals"] = max(0, int(payload.get("lifetimeGoals", 0) or 0)) + match_goals
+            def _submitted_stat(key: str) -> int:
+                try:
+                    return max(0, int(submitted.get(key, 0) or 0))
+                except (TypeError, ValueError):
+                    return 0
+
+            match_goals = _submitted_stat("goals")
+            match_assists = _submitted_stat("assists")
+            # BETA 2.26.1 (dzevallos/f14-localfut#12). The client submits these per
+            # card in /match/end and they were going into `lifetimeGoals`, a member
+            # its JSON key table does not contain -- so nothing read them and the
+            # card screen stayed on zero forever. The two arrays it *does* parse
+            # are statsList (id 503) and lifetimeStats (id 268), and neither was
+            # ever written. Games played is counted for the eleven that actually
+            # started, which is the same set the contract decrement uses.
+            if decrement_contracts:
+                bumps = {
+                    "goals": match_goals,
+                    "assists": match_assists,
+                    "yellowCards": _submitted_stat("yellowCards"),
+                    "redCards": _submitted_stat("redCards"),
+                    "gamesPlayed": 1 if item_id in starters else 0,
+                }
+                self._bump_card_stats(payload, bumps)
             if match_assists:
                 payload["lifetimeAssists"] = max(0, int(payload.get("lifetimeAssists", 0) or 0)) + match_assists
                 payload["assists"] = max(0, int(payload.get("assists", 0) or 0)) + match_assists
@@ -2304,6 +2613,41 @@ class BetaIdentityStore(LocalIdentityStore):
             )
             updated.append(canonical)
         return updated
+
+    @staticmethod
+    def _bump_card_stats(payload: dict[str, Any], bumps: dict[str, int]) -> None:
+        """Add a match's contribution to a card's own stat arrays, in place.
+
+        Both spellings are kept in step: `statsList`/`lifetimeStats` are what the
+        client parses, `statsArray`/`lifetimeStatsArray` are the backend aliases
+        the canonicaliser reads back. Writing only one of them would have the
+        rebuild quietly discard the other.
+        """
+        if not any(int(value or 0) > 0 for value in bumps.values()):
+            return
+        for list_key, array_key in (("statsList", "statsArray"),
+                                    ("lifetimeStats", "lifetimeStatsArray")):
+            current = [0] * PLAYER_STAT_COUNT
+            source = payload.get(list_key)
+            if isinstance(source, list):
+                for position, entry in enumerate(source[:PLAYER_STAT_COUNT]):
+                    try:
+                        if isinstance(entry, dict):
+                            index = int(entry.get("index", position))
+                            value = int(entry.get("value", 0) or 0)
+                        else:
+                            index, value = position, int(entry)
+                    except (TypeError, ValueError):
+                        continue
+                    if 0 <= index < PLAYER_STAT_COUNT:
+                        current[index] = max(0, value)
+            for name, amount in bumps.items():
+                index = PLAYER_CARD_STAT_INDEX.get(name)
+                if index is None or int(amount or 0) <= 0:
+                    continue
+                current[index] = min(PLAYER_STAT_MAX, current[index] + int(amount))
+            payload[list_key] = [{"index": n, "value": v} for n, v in enumerate(current)]
+            payload[array_key] = list(current)
 
     def _active_match_context(self) -> tuple[int | None, list[int]]:
         """Return tournament identity and the MatchReady starting XI for the active match."""
@@ -2536,6 +2880,7 @@ class BetaIdentityStore(LocalIdentityStore):
             )
 
         tournament_id, starting_xi_ids = self._active_match_context()
+        season_division = None if tournament_id is not None else self._active_match_season_division()
         settlement = self.settle_match(normalized)
         first_settlement = not bool(settlement.get("idempotent", False))
         with self._lock, closing(self._connect()) as connection, connection:
@@ -2556,6 +2901,25 @@ class BetaIdentityStore(LocalIdentityStore):
                     end_reason,
                     match_id=str(settlement.get("matchId") or ""),
                 )
+            season_state: dict[str, Any] = {}
+            if first_settlement and season_division is not None and end_reason in {"WIN", "DRAW", "LOSS", "QUIT", "DNF"}:
+                # The client keeps its own points in the blob it PUTs back, and
+                # the round it sends is what the screen shows. This tally is the
+                # server's own copy, and it is what settles promotion at the end
+                # of the season -- the client never tells us the outcome.
+                season_state = self._settle_season_result_locked(
+                    connection,
+                    persona_id,
+                    int(season_division),
+                    end_reason,
+                    match_id=str(settlement.get("matchId") or ""),
+                )
+                if season_state:
+                    _diagnostic(
+                        f"offline season division {season_division}: {end_reason} in match "
+                        f"{season_state['matchesPlayed']}/{season_state['seasonMatches']}, "
+                        f"{season_state['points']} point(s)"
+                    )
 
         # FutDestroyMatchServerResponse.items is NOT ItemData. The retail
         # serializer expects per-player match-stat rows. BETA 2.22 returned full
@@ -2595,6 +2959,11 @@ class BetaIdentityStore(LocalIdentityStore):
             seconds_played = max(60, int(settlement.get("reward", {}).get("minutesPlayed", 90) or 90) * 60)
 
         match_difficulty = max(0, int(document.get("matchDifficulty", 0) or 0))
+        if match_difficulty <= 0 and season_state:
+            # The fixture just played is the one before the round we advanced to.
+            match_difficulty = _season_difficulty(
+                int(season_state["divisionId"]), max(0, int(season_state["matchesPlayed"]) - 1)
+            )
         if match_difficulty <= 0 and tournament_id is not None:
             definition = self._offline_tournament_definition(int(tournament_id))
             round_defs = definition.get("rounds", []) if isinstance(definition, dict) else []
@@ -2666,7 +3035,212 @@ class BetaIdentityStore(LocalIdentityStore):
     @staticmethod
     def entry_season_division() -> int:
         """The division a club with no season history starts in."""
-        return int(OFFLINE_SEASON_DIVISIONS[0][0])
+        return _entry_season_division()
+
+    # ---- offline seasons -------------------------------------------------
+    #
+    # Three documents have to agree or the Seasons screen has nothing to show:
+    # the list says which season record carries which division, season/user says
+    # which of those records the club is in and how far through it is, and the
+    # client's own PUT says what it believes. BETA 2.26 served the list from the
+    # ladder and season/user from a seeded tally that nothing ever updated, so a
+    # played season came back as season 2 / division 10 against a list holding
+    # only season 1 / division 11: no match, no "underway", no saved progress.
+
+    def _season_row_locked(
+        self, connection: sqlite3.Connection, persona_id: int
+    ) -> sqlite3.Row:
+        """The club's current season row, seeding the entry division if absent."""
+        row = connection.execute(
+            "SELECT * FROM beta_season_progress WHERE persona_id=?", (int(persona_id),)
+        ).fetchone()
+        if row is None:
+            now = int(time.time())
+            division = _entry_season_division()
+            connection.execute(
+                """INSERT INTO beta_season_progress
+                (persona_id,season_id,division,round_value,started_at,updated_at)
+                VALUES (?,?,?,1,?,?)""",
+                (int(persona_id), _season_ladder_id(division), division, now, now),
+            )
+            row = connection.execute(
+                "SELECT * FROM beta_season_progress WHERE persona_id=?", (int(persona_id),)
+            ).fetchone()
+        return row
+
+    def _pending_season_division_locked(
+        self,
+        connection: sqlite3.Connection,
+        persona_id: int,
+        document: dict[str, Any] | None = None,
+    ) -> int | None:
+        """The division of a season this match is being played inside, if any.
+
+        Offline FUT only has two competitions. A cup match carries its
+        tournamentId in the create-match body, so the remaining signal for a
+        season match is the save the Seasons screen writes just before kickoff.
+        """
+        document = document if isinstance(document, dict) else {}
+        try:
+            if int(document.get("tournamentId", 0) or 0) > 0:
+                return None
+        except (TypeError, ValueError):
+            pass
+        row = self._season_row_locked(connection, persona_id)
+        _div, _name, matches, _promote, _coins = _season_definition(int(row["division"]))
+        if int(row["matches_played"]) >= int(matches):
+            return None
+        saved_at = int(row["saved_at"] or 0)
+        if not saved_at or int(time.time()) - saved_at > SEASON_MATCH_SAVE_WINDOW_SECONDS:
+            return None
+        return int(row["division"])
+
+    def _active_match_season_division(self) -> int | None:
+        """The season division stamped on the active match session, if any."""
+        with self._lock, closing(self._connect()) as connection:
+            persona_id = int(self._identity(connection)["persona_id"])
+            row = connection.execute(
+                "SELECT raw_result_json FROM beta_match_sessions "
+                "WHERE persona_id=? AND status='active' AND settled=0 "
+                "ORDER BY created_at DESC LIMIT 1",
+                (persona_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row["raw_result_json"] or "{}")
+            division = int(payload.get("_seasonDivision", 0) or 0)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return division or None
+
+    def _finish_season_if_complete_locked(
+        self, connection: sqlite3.Connection, persona_id: int
+    ) -> dict[str, Any] | None:
+        """Settle a season whose fixtures are all played and open the next one.
+
+        Deliberately lazy: the client sends its last round PUT *after* the final
+        match settles, so rolling the ladder over at settle time would have the
+        trailing write land on a season that no longer exists. Rolling here, on
+        the first read the Seasons screen makes afterwards, means the whole final
+        result is in before the division moves.
+        """
+        row = self._season_row_locked(connection, persona_id)
+        division = int(row["division"])
+        _div, _name, matches, promote, championship_coins = _season_definition(division)
+        played = max(int(row["matches_played"]), int(row["round_value"]) - 1)
+        if played < int(matches):
+            return None
+
+        points = int(row["points"])
+        record = _native_season_record(
+            _season_ladder_id(division), division, matches, promote, championship_coins
+        )
+        thresholds = {
+            str(prize.get("prizeLevel")): int(prize.get("thresholdPoint", 0) or 0)
+            for prize in record.get("prizeSet", [])
+        }
+        awards = {
+            str(prize.get("prizeLevel")): sum(
+                int(award.get("value", 0) or 0)
+                for mapping in prize.get("awardMappings", [])
+                for award in mapping.get("awards", [])
+            )
+            for prize in record.get("prizeSet", [])
+        }
+        if points >= thresholds.get("CHAMPIONSHIP", 10 ** 6):
+            outcome = "CHAMPIONSHIP"
+        elif points >= thresholds.get("PROMOTION", 10 ** 6):
+            outcome = "PROMOTION"
+        elif points >= thresholds.get("MAINTENANCE", 0):
+            outcome = "MAINTENANCE"
+        else:
+            outcome = "RELEGATION"
+        next_division = _season_next_division(division, outcome)
+        coins = max(0, int(awards.get(outcome, 0)))
+        now = int(time.time())
+        connection.execute(
+            """INSERT OR REPLACE INTO beta_season_history
+            (persona_id,finished_at,season_id,division,next_division,matches_played,
+             points,won,draw,lost,outcome,coins)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (int(persona_id), now, int(row["season_id"]), division, next_division,
+             played, points, int(row["won"]), int(row["draw"]), int(row["lost"]),
+             outcome, coins),
+        )
+        connection.execute(
+            """UPDATE beta_season_progress SET season_id=?,division=?,round_value=1,
+               matches_played=0,points=0,won=0,draw=0,lost=0,data_version=1,
+               season_data='',progress_data_version=1,progress_data='',
+               started_at=?,saved_at=0,updated_at=? WHERE persona_id=?""",
+            (_season_ladder_id(next_division), next_division, now, now, int(persona_id)),
+        )
+        if coins > 0:
+            self._wallet_write_locked(
+                connection,
+                amount=coins,
+                reason="SEASON_PRIZE",
+                reference_type="offline_season",
+                reference_id=f"{int(persona_id)}:{int(row['season_id'])}:{now}",
+                metadata={"division": division, "outcome": outcome, "points": points},
+            )
+        _diagnostic(
+            f"offline season in division {division} finished on {points} point(s) after "
+            f"{played} match(es): {outcome}, {coins} coin(s), next division {next_division}"
+        )
+        return {
+            "division": division, "nextDivision": next_division, "outcome": outcome,
+            "points": points, "coins": coins,
+        }
+
+    @staticmethod
+    def season_save_mode() -> str:
+        """`blob` echoes the client's saved season back; `round` sends progress only.
+
+        season/user is FutSeasonLoadData -- CardsDLLzf.dll puts
+        `RS4:FutSeasonLoadDataServerResponse` next to `?type=offline` -- so the
+        blob belongs in this response if the club is to resume a season it has
+        already played. That member set has never been captured coming *back*
+        from a server, though, and the cup flow proved this parser family reads
+        the response as a stream: an out-of-order dataVersion decoded the wrong
+        buffer and asked for an 808 MB vector (BUG-006). If the screen breaks,
+        `FIFA14_SEASON_SAVE_MODE=round` drops back to the three members the
+        2026-08-16 capture proves parse cleanly, without losing the save.
+        """
+        raw = os.environ.get("FIFA14_SEASON_SAVE_MODE", "blob").strip().lower()
+        return "round" if raw in {"round", "minimal", "off"} else "blob"
+
+    def _season_user_document_locked(
+        self, connection: sqlite3.Connection, persona_id: int
+    ) -> dict[str, Any]:
+        row = self._season_row_locked(connection, persona_id)
+        division = int(row["division"])
+        # CardsDLL decrements the wire `round` value before storing it. Sending 0
+        # therefore becomes 0xFFFF (its invalid/default sentinel). Wire round 1 is
+        # the first scheduled fixture (internal 0).
+        _div, _name, matches, _promote, _coins = _season_definition(division)
+        document: dict[str, Any] = {
+            "seasonId": _season_ladder_id(division),
+            "divisionId": division,
+            "round": max(1, min(int(matches), int(row["round_value"] or 1))),
+        }
+        # Only a season that has actually been saved carries the client's blob; a
+        # fresh one stays at exactly the three members the capture proves parse.
+        # Each buffer is followed by its own version, which is the member order
+        # the cup resume response had to be reshaped into to stop crashing.
+        if str(row["season_data"] or "") and self.season_save_mode() == "blob":
+            document["data"] = str(row["season_data"])
+            document["dataVersion"] = max(1, int(row["data_version"] or 1))
+            if str(row["progress_data"] or ""):
+                document["progressData"] = str(row["progress_data"])
+                document["progressDataVersion"] = max(1, int(row["progress_data_version"] or 1))
+        return document
+
+    def current_season_division(self) -> int:
+        with self._lock, closing(self._connect()) as connection, connection:
+            persona_id = int(self._identity(connection)["persona_id"])
+            self._finish_season_if_complete_locked(connection, persona_id)
+            return int(self._season_row_locked(connection, persona_id)["division"])
 
     def offline_seasons_list(self, query: dict[str, Any] | None = None) -> dict[str, Any]:
         """Return the exact CardsDLL offline-season list schema recovered in BETA 2.6.
@@ -2676,6 +3250,13 @@ class BetaIdentityStore(LocalIdentityStore):
         of the records we return carries one of them. Serve what it asked for
         rather than assuming which divisions it should have wanted; with no
         filter, return the whole ladder as before.
+
+        The club's current division is always included even when the screen did
+        not ask for it. Who owns the offline division is still unproven -- the
+        client has its own GetUsersOfflineDivision and defaults to 11 -- so after
+        a promotion the request may still name the old one. Serving both keeps
+        the requested record on screen *and* lets season/user's new seasonId
+        resolve against a record the client has actually seen.
         """
         seasons = [
             _native_season_record(index, division, matches, promote, coins)
@@ -2688,54 +3269,200 @@ class BetaIdentityStore(LocalIdentityStore):
                     part = part.strip()
                     if part.lstrip("-").isdigit():
                         wanted.add(int(part))
-        if wanted:
-            filtered = [row for row in seasons if int(row.get("divisionId", 0)) in wanted]
-            if filtered:
-                return {"seasons": filtered}
+        if not wanted:
+            return {"seasons": seasons}
+        filtered = [row for row in seasons if int(row.get("divisionId", 0)) in wanted]
+        if not filtered:
             _diagnostic(
                 f"season list asked for division(s) {sorted(wanted)} which the ladder does not "
                 f"contain (it has {[row['divisionId'] for row in seasons]}); returning all"
             )
-        return {"seasons": seasons}
+            return {"seasons": seasons}
+        current = self.current_season_division()
+        if current not in wanted:
+            _diagnostic(
+                f"season list asked for division(s) {sorted(wanted)} but the club is in "
+                f"division {current}; serving both so the new season resolves"
+            )
+            filtered = [
+                row for row in seasons
+                if int(row.get("divisionId", 0)) in wanted | {current}
+            ]
+        return {"seasons": filtered}
 
     def offline_season_user(self) -> dict[str, Any]:
-        """Minimal parser-native current-season state.
+        """Parser-native current-season state, restored from the client's own save.
 
         The retail season/user parser handles seasonId, divisionId and round.
         `seasonId` is decremented by the client, so ID 1 selects the first
-        season-list record. Unknown guessed progression members are omitted.
-
-        The division has to be the entry division rather than a fixed 10, and
-        has to agree with the first record in the list: the client asks the list
-        for that division by number, so the two drifting apart is what leaves
-        the screen with nothing to show.
+        season-list record; it must therefore name the record that carries the
+        division below, because the client asks the list for the division it
+        believes it is in and drops records that do not carry it.
         """
-        division = self.entry_season_division()
-        with self._lock, closing(self._connect()) as connection:
+        with self._lock, closing(self._connect()) as connection, connection:
             persona_id = int(self._identity(connection)["persona_id"])
-            row = connection.execute(
-                "SELECT * FROM beta_offline_seasons WHERE persona_id=? AND division=? AND active=1 ORDER BY season_id LIMIT 1",
-                (persona_id, division),
-            ).fetchone()
-            if row is None:
-                # A club seeded before division 11 existed still has its old
-                # row; fall back to whatever season it does have.
-                row = connection.execute(
-                    "SELECT * FROM beta_offline_seasons WHERE persona_id=? AND active=1 ORDER BY division DESC LIMIT 1",
-                    (persona_id,),
-                ).fetchone()
-                if row is not None:
-                    division = int(row["division"])
-            # CardsDLL decrements the wire `round` value before storing it.
-            # Sending 0 therefore becomes 0xFFFF (its invalid/default sentinel).
-            # Wire round 1 represents the first scheduled match (internal 0).
-            round_index = 0 if row is None else max(0, int(row["matches_played"]))
-        season_id = next(
-            (index for index, entry in enumerate(OFFLINE_SEASON_DIVISIONS, start=1)
-             if int(entry[0]) == division),
-            1,
+            self._finish_season_if_complete_locked(connection, persona_id)
+            return self._season_user_document_locked(connection, persona_id)
+
+    def offline_season_load(self, season_id: int = 0, division: int = 0) -> dict[str, Any]:
+        """GET /season/<id>/division/<div>/user -- the client reloading its own save."""
+        return self.offline_season_user()
+
+    def update_offline_season_user(
+        self, season_id: int, division: int, document: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """PUT /season/<id>/division/<div>/user -- the client saving its season.
+
+        The body is `{round, dataVersion, data, progressDataVersion,
+        progressData}` (captured 2026-08-16). `data` is the client's own
+        compressed season state and is stored and echoed back verbatim; `round`
+        is the wire round of the *next* fixture, so it is what makes the screen
+        come back underway.
+        """
+        document = document if isinstance(document, dict) else {}
+
+        def _positive(key: str) -> int:
+            try:
+                return max(1, int(document.get(key, 1) or 1))
+            except (TypeError, ValueError):
+                return 1
+
+        # Echoed in the client's own write order, which is the order its format
+        # string builds: round, dataVersion, data, progressDataVersion,
+        # progressData. The cup update does the same.
+        payload = {
+            "round": _positive("round"),
+            "dataVersion": _positive("dataVersion"),
+            "data": str(document.get("data") or ""),
+            "progressDataVersion": _positive("progressDataVersion"),
+            "progressData": str(document.get("progressData") or ""),
+        }
+        with self._lock, closing(self._connect()) as connection, connection:
+            persona_id = int(self._identity(connection)["persona_id"])
+            row = self._season_row_locked(connection, persona_id)
+            current_division = int(row["division"])
+            if int(division) and int(division) != current_division:
+                # A save for a season the club is no longer in: the trailing write
+                # after a finished season, or a client that kept its own division.
+                # Never let it move the ladder backwards -- just say what happened.
+                _diagnostic(
+                    f"ignoring a season save for division {int(division)} while the club "
+                    f"is in division {current_division}"
+                )
+                return payload
+            _div, _name, matches, _promote, _coins = _season_definition(current_division)
+            fresh = int(row["matches_played"]) == 0 and int(row["round_value"]) <= 1
+            if fresh and payload["round"] > int(matches):
+                # The client writes its last round after the final match settles,
+                # and that round is one past the fixture list. Landing on a season
+                # that has already been rolled over means it belongs to the one
+                # just finished. Before the rollover the row is not fresh, so the
+                # same write is still accepted there -- which is what lets a
+                # season finish even if no fixture was recognised as a season match.
+                _diagnostic(
+                    f"ignoring a round {payload['round']} season save that arrived after "
+                    f"a new division {current_division} season had already started"
+                )
+                return payload
+            now = int(time.time())
+            connection.execute(
+                """UPDATE beta_season_progress SET round_value=?,data_version=?,season_data=?,
+                   progress_data_version=?,progress_data=?,saved_at=?,updated_at=?
+                   WHERE persona_id=?""",
+                (
+                    max(1, min(int(matches) + 1, payload["round"])),
+                    payload["dataVersion"],
+                    payload["data"],
+                    payload["progressDataVersion"],
+                    payload["progressData"],
+                    now,
+                    now,
+                    persona_id,
+                ),
+            )
+            return payload
+
+    def reset_offline_season(self, season_id: int = 0, division: int = 0) -> dict[str, Any]:
+        """POST/PUT /season/<id>/reset -- abandon the current season, same division."""
+        now = int(time.time())
+        with self._lock, closing(self._connect()) as connection, connection:
+            persona_id = int(self._identity(connection)["persona_id"])
+            self._season_row_locked(connection, persona_id)
+            connection.execute(
+                """UPDATE beta_season_progress SET round_value=1,matches_played=0,points=0,
+                   won=0,draw=0,lost=0,data_version=1,season_data='',progress_data_version=1,
+                   progress_data='',started_at=?,saved_at=0,updated_at=? WHERE persona_id=?""",
+                (now, now, persona_id),
+            )
+            return self._season_user_document_locked(connection, persona_id)
+
+    def offline_season_history(self) -> dict[str, Any]:
+        """GET /season/user/history -- finished seasons, newest first.
+
+        BETA 2.26 answered this with the *active* season list, which is the one
+        document it certainly is not. No capture of a populated history exists,
+        so the records stay in the same member vocabulary as the list.
+        """
+        with self._lock, closing(self._connect()) as connection, connection:
+            persona_id = int(self._identity(connection)["persona_id"])
+            self._finish_season_if_complete_locked(connection, persona_id)
+            rows = connection.execute(
+                "SELECT * FROM beta_season_history WHERE persona_id=? "
+                "ORDER BY finished_at DESC LIMIT 20",
+                (persona_id,),
+            ).fetchall()
+        return {
+            "seasons": [
+                {
+                    "id": int(row["season_id"]),
+                    "type": "OFFLINE",
+                    "divisionId": int(row["division"]),
+                    "numMatches": int(row["matches_played"]),
+                    "points": int(row["points"]),
+                    "won": int(row["won"]),
+                    "draw": int(row["draw"]),
+                    "lost": int(row["lost"]),
+                    "prizeLevel": str(row["outcome"]),
+                }
+                for row in rows
+            ]
+        }
+
+    def _settle_season_result_locked(
+        self,
+        connection: sqlite3.Connection,
+        persona_id: int,
+        division: int,
+        end_reason: str,
+        *,
+        match_id: str,
+    ) -> dict[str, Any]:
+        """Tally one played season fixture. Points are 3/1/0; a DNF counts as a loss."""
+        row = self._season_row_locked(connection, persona_id)
+        if int(row["division"]) != int(division):
+            return {}
+        _div, _name, matches, _promote, _coins = _season_definition(int(division))
+        result = str(end_reason or "").upper()
+        gained = {"WIN": 3, "DRAW": 1}.get(result, 0)
+        won = 1 if result == "WIN" else 0
+        draw = 1 if result == "DRAW" else 0
+        lost = 1 if result in {"LOSS", "DNF", "QUIT"} else 0
+        played = min(int(matches), int(row["matches_played"]) + 1)
+        connection.execute(
+            """UPDATE beta_season_progress SET matches_played=?,points=points+?,won=won+?,
+               draw=draw+?,lost=lost+?,round_value=?,updated_at=? WHERE persona_id=?""",
+            (played, gained, won, draw, lost, min(int(matches) + 1, played + 1),
+             int(time.time()), int(persona_id)),
         )
-        return {"seasonId": season_id, "divisionId": division, "round": round_index + 1}
+        return {
+            "seasonId": _season_ladder_id(int(division)),
+            "divisionId": int(division),
+            "round": min(int(matches) + 1, played + 1),
+            "points": int(row["points"]) + gained,
+            "matchesPlayed": played,
+            "seasonMatches": int(matches),
+            "matchId": str(match_id),
+        }
 
     def tournament_wire_mode(self) -> str:
         raw = os.environ.get("FIFA14_TOURNAMENT_MODE", "native").strip().lower()

@@ -131,6 +131,28 @@ def _load_settings_uncached(path: Path) -> dict[str, Any]:
         if cleaned_prizes:
             settings["tournamentPrizes"] = cleaned_prizes
 
+    club = raw.get("club")
+    if isinstance(club, dict):
+        cleaned_club: dict[str, Any] = {}
+        # The venue every club plays in. The id is what the client renders and
+        # what the tracer forces onto the native offline stadium provider; the
+        # name is only the label this server reports. Bounds are the shipped
+        # stadium id range, so a typo cannot ask the client for a venue that
+        # does not exist -- an unrenderable stadium is a crash, not a blank.
+        if "stadiumId" in club:
+            stadium_id = _bounded(club.get("stadiumId"), 1, 300)
+            if stadium_id is None:
+                _diagnostic("club.stadiumId is not a number; keeping the built-in stadium")
+            else:
+                cleaned_club["stadiumId"] = stadium_id
+        name = club.get("stadiumName")
+        if isinstance(name, str) and name.strip():
+            cleaned_club["stadiumName"] = name.strip()[:96]
+        elif "stadiumName" in club:
+            _diagnostic("club.stadiumName must be a non-empty string; keeping the built-in name")
+        if cleaned_club:
+            settings["club"] = cleaned_club
+
     market = raw.get("market")
     if isinstance(market, dict):
         cleaned_market = {}
