@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "server"))
 sys.path.insert(0, str(ROOT))
 
+import beta_identity as beta_identity_module  # noqa: E402
 from beta_identity import BetaIdentityStore, MATCH_RESULT_FLAT_COINS  # noqa: E402
 
 
@@ -83,10 +84,15 @@ def main() -> int:
         breakdown = json.loads(row[1])
         # Completed results pay the configured flat amount by result, published
         # as the completion component with no stat-derived skill component.
-        require(int(breakdown.get("completionAward", 0)) == int(MATCH_RESULT_FLAT_COINS["WIN"]),
-                f"completion award is not the configured flat WIN payout: {breakdown}")
-        require(int(breakdown.get("skillAward", -1)) == 0,
-                f"flat payout must not publish a stat-derived skill award: {breakdown}")
+        if beta_identity_module.MATCH_REWARD_MODE == "dynamic":
+            require(int(breakdown.get("totalCoins", 0)) > 0 and int(breakdown.get("skillAward", 0)) != 0,
+                    f"dynamic rewards must pay a stat-derived amount: {breakdown}")
+        else:
+            require(int(breakdown.get("completionAward", 0)) == int(MATCH_RESULT_FLAT_COINS["WIN"]),
+                    f"completion award is not the configured flat WIN payout: {breakdown}")
+        if beta_identity_module.MATCH_REWARD_MODE != "dynamic":
+            require(int(breakdown.get("skillAward", -1)) == 0,
+                    f"flat payout must not publish a stat-derived skill award: {breakdown}")
         require(int(breakdown.get("goalsFor", -1)) == 8, f"per-player goals overrode 8-0 team score: {breakdown}")
         require(int(row[0]) == int(breakdown["totalCoins"]) == after - before, "wallet and match reward diverged")
         require(dnf >= 0.25, f"legacy zero DNF multiplier was not repaired: {dnf}")

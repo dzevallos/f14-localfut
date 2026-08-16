@@ -105,6 +105,25 @@ def main() -> int:
             fail("numeric kit/stadium query aliases do not expose the selectable club items")
         if store.club_items({"type": "badges"}).get("total") != 1 or badge_inventory[0].get("itemType") != "custom":
             fail(f"badge/custom My Club alias or wire family is wrong: {badge_inventory}")
+        # The Club Items tab asks for every equippable in one query. The captured
+        # request is `/club?year=2014&type=equippables&level=any&count=11`; that
+        # token matched no branch, so the tab returned an empty page no matter
+        # what was searched (dzevallos/f14-localfut#2).
+        equippables = store.club_items({
+            "year": ["2014"], "type": ["equippables"], "level": ["any"], "count": ["11"],
+        })
+        equippable_families = {row.get("itemType") for row in equippables.get("itemData", [])}
+        if int(equippables.get("total", 0)) != len(kit_inventory) + len(stadium_inventory) + len(badge_inventory):
+            fail(f"type=equippables must return every equippable club item: {equippables.get('total')}")
+        if equippable_families != {"kit", "stadium", "custom"}:
+            fail(f"type=equippables must span the equippable families, got {equippable_families}")
+        first_page = [row.get("id") for row in equippables.get("itemData", [])[:2]]
+        second_page = store.club_items({
+            "year": ["2014"], "type": ["equippables"], "level": ["any"],
+            "start": ["2"], "count": ["11"],
+        }).get("itemData", [])
+        if set(first_page).intersection(row.get("id") for row in second_page):
+            fail("equippable paging repeats items across pages")
 
         home = next(row for row in kit_inventory if int(row.get("assetId", -1)) == 14)
         away = next(row for row in kit_inventory if int(row.get("assetId", -1)) == 15)
@@ -665,7 +684,15 @@ def main() -> int:
         # A completed win pays the configured flat amount and the wallet must
         # move by exactly that. Assert against the constant so a retune does
         # not read as a regression.
-        expected_win = int(MATCH_RESULT_FLAT_COINS["WIN"])
+        # The payout mode is a user setting, and the launcher runs this suite
+        # before startup -- so asserting the flat amount unconditionally would
+        # mean selecting dynamic rewards stopped the game from booting.
+        if beta_identity_module.MATCH_REWARD_MODE == "dynamic":
+            expected_win = int(result["reward"]["totalCoins"])
+            if expected_win <= 0 or int(result["reward"]["skillAward"]) == 0:
+                fail(f"dynamic rewards must pay a stat-derived amount: {result['reward']}")
+        else:
+            expected_win = int(MATCH_RESULT_FLAT_COINS["WIN"])
         if result["rewardCoins"] != expected_win or result["credits"] != expected_win:
             fail(f"FUT14 reward regression: expected {expected_win}, got {result}")
         replay = store.settle_match({"matchId": "verify-match", "completed": 1, "minutesPlayed": 90})
@@ -901,6 +928,12 @@ def main() -> int:
         settings_file = Path(td) / "settings-probe.json"
         os.environ["FIFA14_LOCAL_SETTINGS"] = str(settings_file)
         try:
+            settings_file.write_text('{"matchRewardMode": "dynamic"}', encoding="utf-8")
+            if fut_local_settings.load_settings(refresh=True).get("matchRewardMode") != "dynamic":
+                fail("the dynamic payout mode must be accepted")
+            settings_file.write_text('{"matchRewardMode": "sideways"}', encoding="utf-8")
+            if "matchRewardMode" in fut_local_settings.load_settings(refresh=True):
+                fail("an unknown payout mode must be ignored, not passed through")
             settings_file.write_text('{"matchRewards": {"WIN": -5, "DRAW": "abc"}, '
                                      '"market": {"rotationFraction": 99999}}', encoding="utf-8")
             loaded = fut_local_settings.load_settings(refresh=True)

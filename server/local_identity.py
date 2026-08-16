@@ -155,6 +155,10 @@ MARKET_CONSUMABLE_INDEX = {
 # proves this vocabulary against real captures; consumables are the two item
 # types the catalogue actually carries.
 MARKET_CONSUMABLE_TYPES = frozenset({"development", "training", "consumable", "consumables"})
+# The Club Items tab asks for everything equippable in one query rather than one
+# type at a time. `custom` is the badge family, as club_items already treats it.
+EQUIPPABLE_ITEM_TYPES = ("kit", "stadium", "custom", "ball")
+EQUIPPABLE_TYPE_ALIASES = frozenset({"equippables", "equippable", "clubitems", "club"})
 
 
 def _market_rotation_index(now: int) -> int:
@@ -4067,6 +4071,13 @@ class LocalIdentityStore:
             preload_consumables: list[dict[str, Any]] = []
             player_request = requested_type in {"", "1", "player"}
             consumable_request = requested_type in {"consumable", "consumables"}
+            # "equippables" is the Club Items tab asking for everything the club
+            # can equip at once, captured as
+            # `/club?year=2014&type=equippables&level=any&count=11`. It was not in
+            # the recognised set, so the request fell through every branch and
+            # returned an empty page: the tab simply showed nothing, whatever was
+            # searched (dzevallos/f14-localfut#2).
+            equippable_request = requested_type in EQUIPPABLE_TYPE_ALIASES
             nonplayer_type = requested_type if requested_type in {
                 "development", "training", "kit", "stadium", "custom", "ball", "trophy"
             } else None
@@ -4122,13 +4133,21 @@ class LocalIdentityStore:
                         if resource_id not in CONSUMABLE_BY_RESOURCE:
                             continue
                         preload_consumables.append(consumable)
-            elif consumable_request or nonplayer_type is not None:
+            elif consumable_request or equippable_request or nonplayer_type is not None:
                 if consumable_request:
                     rows = connection.execute(
                         "SELECT payload FROM items WHERE persona_id=? "
                         "AND item_type IN ('development','training') "
                         "AND pile NOT IN ('trade','pending')",
                         (persona_id,),
+                    ).fetchall()
+                elif equippable_request:
+                    placeholders = ",".join("?" for _ in EQUIPPABLE_ITEM_TYPES)
+                    rows = connection.execute(
+                        f"SELECT payload FROM items WHERE persona_id = ? "
+                        f"AND item_type IN ({placeholders}) "
+                        f"AND pile NOT IN ('trade','pending') ORDER BY item_type, item_id",
+                        (persona_id, *EQUIPPABLE_ITEM_TYPES),
                     ).fetchall()
                 else:
                     rows = connection.execute(

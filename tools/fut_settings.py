@@ -48,6 +48,7 @@ def _defaults() -> dict:
         "print(json.dumps({'matchRewards':b.MATCH_RESULT_FLAT_COINS,"
         "'tournamentPrizes':{int(t['tournamentId']):{'name':t['name'],'prize':int(t['prize']),"
         "'repeatPrize':int(t['repeatPrize'])} for t in b.OFFLINE_TOURNAMENTS},"
+        "'matchRewardMode':b.MATCH_REWARD_MODE,"
         "'market':{'rotationFraction':l.MARKET_ROTATION_FRACTION,"
         "'rotationMinutes':l.MARKET_ROTATION_SECONDS//60,"
         "'consumablePrice':l.MARKET_CONSUMABLE_BUY_NOW}}))" % SERVER
@@ -68,7 +69,12 @@ def _effective(defaults: dict, saved: dict) -> dict:
         prizes.setdefault(int(tournament_id), {}).update(override)
     market = dict(defaults["market"])
     market.update(saved.get("market") or {})
-    return {"matchRewards": rewards, "tournamentPrizes": prizes, "market": market}
+    return {
+        "matchRewards": rewards,
+        "matchRewardMode": saved.get("matchRewardMode", defaults.get("matchRewardMode", "flat")),
+        "tournamentPrizes": prizes,
+        "market": market,
+    }
 
 
 def _game_is_running() -> str:
@@ -139,7 +145,11 @@ def _ask_int(prompt: str, current: int, low: int = 0, high: int = 2_000_000_000)
 # --------------------------------------------------------------------------
 def show(defaults: dict, saved: dict) -> None:
     effective = _effective(defaults, saved)
-    print("\n  Match rewards (coins per completed match)")
+    mode = effective.get("matchRewardMode", "flat")
+    mode_mark = "*" if "matchRewardMode" in saved else " "
+    print(f"\n {mode_mark} Match rewards  [mode: {mode}]")
+    if mode == "dynamic":
+        print("     minutes played plus the stat bonus; the amounts below are unused")
     for key in ("WIN", "DRAW", "LOSS", "DNF"):
         value = int(effective["matchRewards"].get(key, 0))
         mark = "*" if key in (saved.get("matchRewards") or {}) else " "
@@ -221,28 +231,34 @@ def edit_market(defaults: dict, saved: dict) -> dict:
     return saved
 
 
-def set_coins() -> None:
+def _set_balance(currency: str) -> None:
+    """Set the coin or FIFA Point balance. Both live on the club row."""
     if not _require_idle() or not SAVE_PATH.is_file():
         return
+    coins = currency == "COINS"
+    column = "coins" if coins else "fifa_points"
+    label = "coin" if coins else "FIFA Point"
     store = _store()
-    current = int(store.credits()["credits"])
-    target = _ask_int("set the coin balance to", current)
+    balances = store.currencies()
+    current = int(balances["credits"] if coins else balances["fifaPoints"])
+    target = _ask_int(f"set the {label} balance to", current)
     if target is None or target == current:
         print("  unchanged.")
         return
-    if _backup("set-coins") is None:
+    if _backup(f"set-{column}") is None:
         return
     from contextlib import closing
     with store._lock, closing(store._connect()) as connection, connection:
         persona_id = int(store._identity(connection)["persona_id"])
-        connection.execute("UPDATE clubs SET coins=? WHERE persona_id=?", (target, persona_id))
+        connection.execute(f"UPDATE clubs SET {column}=? WHERE persona_id=?", (target, persona_id))
         connection.execute(
             "INSERT INTO wallet_transactions (persona_id,created_at,currency,amount,balance_before,"
             "balance_after,reason,reference_type,reference_id,metadata_json) "
-            "VALUES (?,?, 'COINS', ?,?,?, 'MANUAL_ADJUST','settings-tool',?, '{}')",
-            (persona_id, int(time.time()), target - current, current, target, f"set-{int(time.time())}"),
+            "VALUES (?,?,?,?,?,?, 'MANUAL_ADJUST','settings-tool',?, '{}')",
+            (persona_id, int(time.time()), currency, target - current, current, target,
+             f"set-{column}-{int(time.time())}"),
         )
-    print(f"  coins {current:,} -> {target:,}")
+    print(f"  {label}s {current:,} -> {target:,}")
 
 
 def clear_club() -> None:
@@ -287,8 +303,9 @@ MENU = """
   3  Tournament payouts   (first clear / repeat)
   4  Transfer market      (rotation, consumable price)
   5  Set coin balance                        [save]
-  6  Clear club, keep the starter squad      [save]
-  7  Reset all settings to defaults
+  6  Set FIFA Point balance                  [save]
+  7  Clear club, keep the starter squad      [save]
+  8  Reset all settings to defaults
   0  Exit
 """
 
@@ -318,10 +335,12 @@ def main() -> int:
             saved = edit_market(defaults, saved)
             dirty = True
         elif choice == "5":
-            set_coins()
+            _set_balance("COINS")
         elif choice == "6":
-            clear_club()
+            _set_balance("POINTS")
         elif choice == "7":
+            clear_club()
+        elif choice == "8":
             saved = reset_settings()
             dirty = False
         else:
