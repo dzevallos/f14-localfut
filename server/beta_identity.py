@@ -453,6 +453,26 @@ def _entry_season_division() -> int:
     return int(OFFLINE_SEASON_DIVISIONS[0][0])
 
 
+# Retail FUT 14 has divisions 10..1. The client asks the season list for division
+# 11, but that looks like its "not placed in a division yet" value rather than a
+# division you can be in -- and reporting 11 back as the club's *current*
+# division is what both 0.4 failures have in common:
+#
+#   seasonId / divisionId / result
+#      1 / 10  bounce, then "unavailable", with crash dumps (superseded tree)
+#      2 / 10  the one run that opened, drew its fixtures and played a match
+#      1 / 11  access violation reading null on entry (0.4.2)
+#     12 / 11  "seasons are currently unavailable" (0.4.3)
+#
+# So season/user reports a real division, and the list keeps answering for
+# whatever division the screen asked about. Serving 11 in the list is fine --
+# that is the request being honoured; claiming to be *in* 11 is not.
+def _first_real_division() -> int:
+    """The lowest division the client itself recognises (10 in retail FUT 14)."""
+    real = [int(entry[0]) for entry in OFFLINE_SEASON_DIVISIONS if int(entry[0]) <= 10]
+    return max(real) if real else int(OFFLINE_SEASON_DIVISIONS[0][0])
+
+
 def _season_ladder_id(division: int) -> int:
     """The 1-based season-list `id` that carries a division.
 
@@ -3217,42 +3237,15 @@ class BetaIdentityStore(LocalIdentityStore):
                 raw = ""
         return "round" if raw in {"round", "minimal", "off"} else "blob"
 
-    @staticmethod
-    def _no_current_season_id() -> int:
-        """A seasonId that deliberately matches no record in the served list.
-
-        Claiming a current season the client cannot load is what has broken this
-        screen every time it has been tried, and the 2026-08-16 16:53 crash dump
-        is the clearest instance: the client parsed seasonId/divisionId/round,
-        resolved seasonId 1 to the division-11 record, walked into its resume
-        path and read through a null pointer (access violation at
-        CardsDLLzf+0xc66dd, `cmp byte ptr [esi], 5` with esi = 0). The pointer is
-        the season state the client saved for itself -- which a club that has
-        never played a season does not have.
-
-        The A/B across this project's whole history says the same thing twice:
-
-        * BETA 2.26 served seasonId 2 against a list holding only id 1 -- it did
-          not resolve, and that is the *one* run where the screen opened, drew
-          its fixtures and played a match;
-        * the superseded tree served a resolving seasonId 1, and that era's
-          symptom was the menu bounce, then "seasons are currently unavailable",
-          with crash dumps.
-
-        So a fresh club reports no current season, and a seasonId is only claimed
-        once the client's own save exists to go with it -- which it does from the
-        first visit onward, because the screen writes that save before kickoff.
-        One past the ladder rather than 0: the proven-survivable value was above
-        the served ids, and 0 would decrement into the client's own -1 sentinel,
-        which is untested here.
-        """
-        return len(OFFLINE_SEASON_DIVISIONS) + 1
-
     def _season_user_document_locked(
         self, connection: sqlite3.Connection, persona_id: int
     ) -> dict[str, Any]:
         row = self._season_row_locked(connection, persona_id)
         division = int(row["division"])
+        if division > _first_real_division():
+            # Never report the client's own "unplaced" number back to it as the
+            # division the club is in; see _first_real_division.
+            division = _first_real_division()
         # CardsDLL decrements the wire `round` value before storing it. Sending 0
         # therefore becomes 0xFFFF (its invalid/default sentinel). Wire round 1 is
         # the first scheduled fixture (internal 0).
@@ -3262,10 +3255,12 @@ class BetaIdentityStore(LocalIdentityStore):
             "divisionId": division,
             "round": max(1, min(int(matches), int(row["round_value"] or 1))),
         }
-        # A seasonId is only claimed when the client's own save exists to back
-        # it; without one the season is reported as not current at all. See
-        # _no_current_season_id -- resolving to a record we cannot load is what
-        # crashed the client on 2026-08-16.
+        # seasonId always names the ladder record for the division reported
+        # above, so the two members are self-consistent. The one run that ever
+        # opened this screen sent exactly that -- seasonId 2 with divisionId 10 --
+        # and it did not matter that the list being served at the time held a
+        # different division. What broke the two 0.4 attempts was the *division*,
+        # not the id; see _first_real_division.
         #
         # Each buffer is followed by its own version, which is the member order
         # the cup resume response had to be reshaped into to stop crashing.
@@ -3275,8 +3270,6 @@ class BetaIdentityStore(LocalIdentityStore):
             if str(row["progress_data"] or ""):
                 document["progressData"] = str(row["progress_data"])
                 document["progressDataVersion"] = max(1, int(row["progress_data_version"] or 1))
-        else:
-            document["seasonId"] = self._no_current_season_id()
         return document
 
     def current_season_division(self) -> int:
