@@ -2968,6 +2968,13 @@ class BetaIdentityStore(LocalIdentityStore):
                 row: dict[str, Any] = {"id": item_id}
                 for key in allowed_item_keys[1:]:
                     if key not in raw:
+                        if key in {"redCards", "suspension"}:
+                            # Keep the sparse match-stat contract, but make the
+                            # two card-availability fields explicit. The retail
+                            # client reuses local ItemData while applying this
+                            # response; omitted zeroes can leave stale red-card
+                            # state visible after a completed match.
+                            row[key] = 0
                         continue
                     if key == "injuryType":
                         row[key] = str(raw.get(key) or "none")
@@ -3086,6 +3093,19 @@ class BetaIdentityStore(LocalIdentityStore):
                 (persona_id,season_id,division,round_value,started_at,updated_at)
                 VALUES (?,?,?,1,?,?)""",
                 (int(persona_id), _season_ladder_id(division), division, now, now),
+            )
+            row = connection.execute(
+                "SELECT * FROM beta_season_progress WHERE persona_id=?", (int(persona_id),)
+            ).fetchone()
+        elif int(row["division"]) > _first_real_division():
+            # Division 11 is a client-side unplaced request, not a persisted
+            # ladder tier. Older builds could store that request value from
+            # PUT /season/<id>/division/11/user; normalize the alias before
+            # match or resume code consumes it.
+            canonical_division = _first_real_division()
+            connection.execute(
+                "UPDATE beta_season_progress SET season_id=?,division=? WHERE persona_id=?",
+                (int(_season_ladder_id(canonical_division)), int(canonical_division), int(persona_id)),
             )
             row = connection.execute(
                 "SELECT * FROM beta_season_progress WHERE persona_id=?", (int(persona_id),)
@@ -3254,11 +3274,6 @@ class BetaIdentityStore(LocalIdentityStore):
         # therefore becomes 0xFFFF (its invalid/default sentinel). Wire round 1 is
         # the first scheduled fixture (internal 0).
         _div, _name, matches, _promote, _coins = _season_definition(division)
-        document: dict[str, Any] = {
-            "seasonId": _season_ladder_id(division),
-            "divisionId": division,
-            "round": max(1, min(int(matches), int(row["round_value"] or 1))),
-        }
         # Two independent things have to be right here, and each was learned the
         # hard way:
         #
@@ -3267,18 +3282,19 @@ class BetaIdentityStore(LocalIdentityStore):
         #   "unavailable" on 0.4.3.
         #
         #   seasonId must not resolve to a served record until the client's own
-        #   save exists to go with it. Resolving sends it into the resume path,
-        #   which dereferences that save.
-        #
-        # A fresh club therefore sends seasonId 2 / divisionId 10 / round 1 --
-        # byte for byte the one document ever observed to open this screen, draw
-        # its fixtures and play a match.
+        #   save exists to go with it (seasonId = -1 causes CardsDLL to take the
+        #   fresh-season initialization path at 0x1006223e without dereferencing
+        #   null data).
         #
         # Each buffer is followed by its own version, which is the member order
         # the cup resume response had to be reshaped into to stop crashing.
-        if not str(row["season_data"] or "") or self.season_save_mode() != "blob":
-            document["seasonId"] = _season_ladder_id(division) + 1
-        if str(row["season_data"] or "") and self.season_save_mode() == "blob":
+        has_save = bool(str(row["season_data"] or "")) and self.season_save_mode() == "blob"
+        document: dict[str, Any] = {
+            "seasonId": _season_ladder_id(division) if has_save else -1,
+            "divisionId": division,
+            "round": max(1, min(int(matches), int(row["round_value"] or 1))),
+        }
+        if has_save:
             document["data"] = str(row["season_data"])
             document["dataVersion"] = max(1, int(row["data_version"] or 1))
             if str(row["progress_data"] or ""):
@@ -3321,29 +3337,26 @@ class BetaIdentityStore(LocalIdentityStore):
                         wanted.add(int(part))
         if not wanted:
             return {"seasons": seasons}
-        filtered = [row for row in seasons if int(row.get("divisionId", 0)) in wanted]
-        if not filtered:
-            # 11 is the client's "not placed in a division yet" value, so this is
-            # the normal question from a club with no season history: offer it the
-            # entry division. Returning the whole ladder instead is what produced
-            # "seasons are currently unavailable" before BETA 2.26.
-            entry = [row for row in seasons if int(row["divisionId"]) == _entry_season_division()]
-            _diagnostic(
-                f"season list asked for division(s) {sorted(wanted)}, which the ladder "
-                f"({[row['divisionId'] for row in seasons]}) does not contain; "
-                f"offering division {_entry_season_division()}"
-            )
-            return {"seasons": entry or seasons}
+        ladder_divs = {int(r["divisionId"]) for r in seasons}
+        entry_def = _season_definition(_entry_season_division())
+        mapped_unplaced: list[dict[str, Any]] = []
+        for div in sorted(wanted):
+            if div not in ladder_divs:
+                mapped_unplaced.append(
+                    _native_season_record(1, div, entry_def[2], entry_def[3], entry_def[4])
+                )
+        filtered = [row for row in seasons if int(row.get("divisionId", 0)) in wanted] + mapped_unplaced
         current = self.current_season_division()
-        if current not in wanted:
+        if current not in wanted and current in ladder_divs and not (
+            current == _entry_season_division() and _entry_season_division() not in wanted
+        ):
             _diagnostic(
                 f"season list asked for division(s) {sorted(wanted)} but the club is in "
                 f"division {current}; serving both so the new season resolves"
             )
-            filtered = [
-                row for row in seasons
-                if int(row.get("divisionId", 0)) in wanted | {current}
-            ]
+            filtered.extend([row for row in seasons if int(row.get("divisionId", 0)) == current])
+        for index, row in enumerate(filtered, start=1):
+            row["id"] = index
         return {"seasons": filtered}
 
     def offline_season_user(self) -> dict[str, Any]:
@@ -3397,7 +3410,12 @@ class BetaIdentityStore(LocalIdentityStore):
             persona_id = int(self._identity(connection)["persona_id"])
             row = self._season_row_locked(connection, persona_id)
             current_division = int(row["division"])
-            if int(division) and int(division) != current_division:
+            requested_division = int(division or 0)
+            if requested_division > _first_real_division() and current_division == _first_real_division():
+                # The client writes its unplaced request value (11) even after
+                # the server maps the entry content to real Division 10.
+                requested_division = _first_real_division()
+            if requested_division and requested_division != current_division:
                 # A save for a season the club is no longer in: the trailing write
                 # after a finished season, or a client that kept its own division.
                 # Never let it move the ladder backwards -- just say what happened.

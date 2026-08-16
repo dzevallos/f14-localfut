@@ -143,9 +143,10 @@ divisions served next to the club's actual division on every request.
 
 **Which stat is in which slot on a player card?** Goals and appearances now accumulate,
 but each card carries five unlabelled stat slots and the order is inferred, not
-recorded. Turn the probe on and every card reports 11/22/33/44/55 in those five slots,
-so one look at a card detail screen decodes it. Your stored totals are untouched — the
-probe only changes what is sent to the game.
+recorded. Turn the probe on and every card reports 11/22/0/44/55 in those five slots,
+so one look at a card detail screen decodes the non-red-card slots without making the
+client suspend every card. Your stored totals are untouched — the probe only changes
+what is sent to the game.
 
 Both switches live in **`FUT_SETTINGS.cmd` → 9 (Testing switches)**, which writes them
 to the settings file beside your save:

@@ -355,24 +355,22 @@ def main() -> int:
         served_ids = {int(row["id"]) for row in season_rows}
         if not 1 <= int(season_user["divisionId"]) <= 10:
             fail(f"season/user must report a division the client recognises (10..1): {season_user}")
-        # Against the list the client actually holds -- it asks about one division
-        # at a time, so this is the single entry record, not the whole ladder.
         held_ids = {int(r["id"]) for r in store.offline_seasons_list({"divisionList": ["11"]})["seasons"]}
         if int(season_user["seasonId"]) in held_ids:
             fail(f"a season with no saved state must not claim a seasonId the client holds: {season_user}")
-        if season_user != {"seasonId": 2, "divisionId": 10, "round": 1}:
-            fail(f"fresh season/user drifted off the one document proven to work: {season_user}")
+        if season_user != {"seasonId": -1, "divisionId": 10, "round": 1}:
+            fail(f"fresh season/user must send sentinel -1 so CardsDLL initializes fresh state: {season_user}")
         # The screen names the divisions it wants; serve those.
         asked = store.offline_seasons_list({"divisionList": [str(store.entry_season_division())]})
         if [int(r["divisionId"]) for r in asked["seasons"]] != [store.entry_season_division()]:
             fail(f"a divisionList filter must be honoured: {[r['divisionId'] for r in asked['seasons']]}")
-        # 11 is the client's "not placed yet" value, and a division we do not
-        # have must offer the entry season rather than the whole ladder -- dumping
-        # every record is what produced "seasons are currently unavailable".
+        # 11 is the client's "not placed yet" value, and unplaced requests must
+        # serve the requested division so CardsDLL's `11 - divisionId == user_division`
+        # check matches rather than showing "seasons are currently unavailable".
         for unplaced in ("11", "99"):
             offered = store.offline_seasons_list({"divisionList": [unplaced]})["seasons"]
-            if [int(r["divisionId"]) for r in offered] != [store.entry_season_division()]:
-                fail(f"divisionList={unplaced} must offer only the entry division: "
+            if int(unplaced) not in [int(r["divisionId"]) for r in offered]:
+                fail(f"divisionList={unplaced} must offer the requested division: "
                      f"{[r['divisionId'] for r in offered]}")
 
         # BETA 2.26.1 -- offline seasons persist and the ladder has real tiers.
@@ -431,6 +429,24 @@ def main() -> int:
         after_reset = store.offline_season_user()
         if int(after_reset["round"]) != 1 or int(after_reset["divisionId"]) > 10:
             fail(f"a season reset must return the club to round 1 in a real division: {after_reset}")
+        # A previous build persisted the client's unplaced request (11) as the
+        # season division. It must migrate to the real entry tier without losing
+        # the saved round/blob, and a subsequent PUT using 11 must remain an
+        # accepted alias rather than being discarded as stale.
+        with closing(sqlite3.connect(db)) as migration_con, migration_con:
+            migration_con.execute(
+                "UPDATE beta_season_progress SET season_id=1,division=11,round_value=2,"
+                "matches_played=1,points=3,season_data='MIGRATE',progress_data='PROGRESS' "
+                "WHERE persona_id=1000001"
+            )
+        migrated = store.offline_season_user()
+        if migrated.get("divisionId") != 10 or migrated.get("round") != 2 or migrated.get("data") != "MIGRATE":
+            fail(f"persisted unplaced division was not migrated without losing progress: {migrated}")
+        aliased = store.update_offline_season_user(
+            1, 11, {"round": 2, "dataVersion": 1, "data": "ALIAS", "progressDataVersion": 1, "progressData": "P"}
+        )
+        if aliased.get("data") != "ALIAS" or store.offline_season_user().get("data") != "ALIAS":
+            fail(f"divisionList=11 save alias was discarded after migration: {aliased}")
 
         # BETA 2.22 keeps the proven native PC tournament schema but exposes
         # four independent knockout cups. `rounds` remains an ARRAY; names are

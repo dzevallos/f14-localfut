@@ -204,9 +204,12 @@ def main() -> int:
         store.match_ready({"items": [{"id": item_id} for item_id in eleven]})
         stat_items = [{"id": item_id} for item_id in eleven] + [{"id": reserve}]
         stat_items[0] = {"id": scorer, "goals": 2, "assists": 1, "yellowCards": 1}
-        store.settle_match_end({
+        settled = store.settle_match_end({
             "endReason": "WIN", "items": stat_items, "matchData": "beta2261-card-stats",
         })
+        require(all(row.get("redCards") == 0 and row.get("suspension") == 0
+                    for row in settled.get("items", [])),
+                f"completed match must explicitly clear absent red-card state: {settled.get('items')}")
         index = beta_identity_module.PLAYER_CARD_STAT_INDEX
         after_one = card_stats(scorer)
         expected = [0] * 5
@@ -231,7 +234,7 @@ def main() -> int:
         finally:
             _os.environ.pop("FIFA14_PLAYER_STAT_PROBE", None)
         probed = [int(e["value"]) for e in wire["players"][0]["itemData"]["statsList"]]
-        require(probed == [11, 22, 33, 44, 55], f"the stat probe did not stamp its sentinels: {probed}")
+        require(probed == [11, 22, 0, 44, 55], f"the stat probe did not stamp its safe sentinels: {probed}")
         require(card_stats(scorer) == expected,
                 f"the stat probe overwrote stored career totals: {card_stats(scorer)}")
 

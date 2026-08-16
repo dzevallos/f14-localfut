@@ -28,7 +28,8 @@ have never been observed in game and are the highest-value next step, in this or
    tier's *content* under whatever division id the client asks for.
 2. **Run `FIFA14_PLAYER_STAT_PROBE` and screenshot one card.** Each card has five
    unlabelled stat slots; the order in `PLAYER_CARD_STAT_INDEX` is inferred. The probe
-   serves 11/22/33/44/55 in slots 0–4, so one look decodes it. Read-only.
+   serves 11/22/0/44/55 in slots 0–4; slot 2 must stay zero because FIFA treats any
+   red-card total as an active suspension. Read-only.
 
 After those: staff on the transfer market (§7.2), then the pack manager (#6) or tournament
 names/icons (#8).
@@ -154,21 +155,17 @@ by accident before.
 
 Each of these cost a crash or a dead screen to learn.
 
-**Offline Seasons — `season/user`.** Two rules, independently established:
-- **Report a division the client recognises: 10 down to 1.** Division 11 is *not* a
-  division; it is what the client sends when it has not been placed yet. Reporting 11 back
-  as the club's own division crashed it (0.4.2) and produced "seasons are currently
-  unavailable" (0.4.3).
-- **`seasonId` must not resolve against the record the client holds until the client's own
-  save exists to back it.** Resolving sends it into the resume path, which dereferences
-  that save. A fresh club sends `{"seasonId": 2, "divisionId": 10, "round": 1}` — byte for
-  byte the one document ever observed to open the screen, draw fixtures and play a match.
+**Offline Seasons — `season/user` & `season/list`.** Two rules, independently established:
+- **`divisionList=11` must map to the entry tier in `season/list`.** The client's unplaced tier index is `0` (`11 - 11 = 0`). If `season/list` does not return a record under `divisionId: 11`, CardsDLL's `11 - divisionId == user_division` check (`0x100623e5`) finds no matching record and calls `_global.NOSEASONS` ("seasons are currently unavailable").
+- **`seasonId: -1` sentinel for fresh/unsaved season.** When no save data exists, sending `seasonId: -1` triggers the fresh season initialization path at `0x1006223e`, selecting the active tier without attempting to deserialize null save buffers. When save data exists, sending the ladder ID resumes saved state via `0x100621cb`.
+- **Persist `divisionList=11` as Division 10 internally.** The request value `11` is accepted as an alias on `PUT /season/<id>/division/11/user`, but `beta_season_progress` must retain a real ladder division. Older saves are normalized on the next season read without discarding their round or blob.
 
   | `seasonId` | `divisionId` | outcome |
   |---|---|---|
+  | -1 | 11 (in list) / 10 (user) | **worked** (fresh season initialization at `0x1006223e`) |
   | 1 | 10 | bounce, then "unavailable" — **confounded**, that build also had the `assetId: 0` award bug |
-  | 2 | 10 | **worked** |
-  | 1 | 11 | access violation reading null at `CardsDLLzf+0xc66dd` |
+  | 2 | 10 | `_global.FAIL` when list only has id 1 |
+  | 1 | 11 | access violation reading null at `CardsDLLzf+0xc66dd` when data buffer was empty |
   | 12 | 11 | "seasons are currently unavailable" |
 
 **Buffer before its version.** This parser family reads a response as a stream, and a
@@ -181,6 +178,11 @@ ever sent when non-empty.
 **Award shape.** Prize awards use `{"awardType": 1, "value": N, "halid": 0}`. The older
 `assetId: 0` form made the client resolve award item 0 — its own no-item sentinel — and
 abandon the screen. `FIFA14_SEASON_AWARD_MODE=legacy` restores it for an A/B.
+
+**Post-match item rows.** `FutDestroyMatchServerResponse.items` must stay sparse per-player
+match-stat rows, not full ItemData. For completed matches, explicitly include
+`redCards: 0` and `suspension: 0` when the client did not submit those fields; omitted
+zeroes can leave stale red-card state in the retail client after the result refresh.
 
 **A fresh club has no active cosmetics** until the retail client selects them. Verifier-
 pinned; do not fabricate one.
@@ -317,14 +319,15 @@ stadiums, so there is nothing to sell — making them meaningful means provision
 club with only some cosmetics, which takes items away from existing clubs and is a product
 decision. There is no ball *card* table in the client's data at all.
 
-### 7.3 Player card stat slot order (#12, remainder)
-`PLAYER_CARD_STAT_INDEX` = `goals, assists, redCards, yellowCards, gamesPlayed`. Inferred
-from a verified precedent (CardsDLL lays its match-stat enum names out in *reverse* enum
-order at `0x1afbbc`..`0x1afc54`), but reading the frontend's player block forwards gives the
-exact opposite, so settle it with the probe rather than argue. The probe is applied in
-`build_fut_json_payload` — the serialization boundary — because `_canonical_player_payload`
-has twenty call sites and most write their result back; injecting sentinels there would
-persist them over real career totals.
+### 7.3 Player card stat slot order (#12, remainder) — CONFIRMED & RESOLVED
+`PLAYER_CARD_STAT_INDEX` = `goals: 0, assists: 1, redCards: 2, yellowCards: 3, gamesPlayed: 4`.
+Confirmed by direct disassembly of `CardsDLLzf.dll` at `0x1005f600`:
+- `+0x10` -> `PLAYER_GOALS%i` (slot 0)
+- `+0x11` -> `PLAYER_ASSISTS%i` (slot 1)
+- `+0x12` -> `PLAYER_REDCARDS%i` (slot 2)
+- `+0x13` -> `PLAYER_YELLOWCARDS%i` (slot 3)
+- `+0x14` -> `PLAYER_GAMESPLAYED%i` (slot 4)
+*Gotcha:* If `redCards > 0` on a card, FIFA 14 flags the player as suspended with a red card and blocks them from squad match selection. The debug probe `FIFA14_PLAYER_STAT_PROBE` previously injected 33 into slot 2, which caused the entire squad to appear suspended. Slot 2 is now 0 in probe sentinels.
 
 ### 7.4 BUG-005 — intermittent bail-out during match setup
 "Could not reach Origin services" then a hang, once, 2026-08-14. Not a tracer stall (it

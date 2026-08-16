@@ -244,16 +244,13 @@ PLAYER_STAT_MAX = 9999
 # nothing ever wrote either array -- the settle path put goals in a
 # `lifetimeGoals` member that is not in the client's JSON key table at all).
 #
-# The order below is an INFERENCE with a named test, not a recorded observation.
-# CardsDLLzf.dll lays its match-stat enum names out in reverse enum order -- the
-# table at 0x1afbbc..0x1afc54 reads OFFSIDES, RED_CARDS ... SHOTS_ON_TARGET while
-# the captured member order is goals, shotsOnTarget ... redCards, offsides -- and
-# applying that same reversal to the frontend's player block (0x191f10..0x191f68:
-# PLAYER_GAMESPLAYED, PLAYER_YELLOWCARDS, PLAYER_REDCARDS, PLAYER_ASSISTS,
-# PLAYER_GOALS) gives goals first. The two readings are exact opposites of each
-# other, so settle it in one look rather than argue: FIFA14_PLAYER_STAT_PROBE=1
-# serves 11/22/33/44/55 in slots 0..4 of every card, and whatever the card detail
-# screen prints against each label is the mapping.
+# The 5-slot order is confirmed by CardsDLLzf.dll disassembly at 0x1005f600:
+#   +0x10 -> PLAYER_GOALS%i       (index 0)
+#   +0x11 -> PLAYER_ASSISTS%i     (index 1)
+#   +0x12 -> PLAYER_REDCARDS%i    (index 2)
+#   +0x13 -> PLAYER_YELLOWCARDS%i (index 3)
+#   +0x14 -> PLAYER_GAMESPLAYED%i (index 4)
+# Note: When redCards > 0 on a card, FIFA 14 considers the player suspended.
 PLAYER_CARD_STAT_INDEX = {
     "goals": 0,
     "assists": 1,
@@ -261,7 +258,7 @@ PLAYER_CARD_STAT_INDEX = {
     "yellowCards": 3,
     "gamesPlayed": 4,
 }
-PLAYER_CARD_STAT_PROBE_VALUES = (11, 22, 33, 44, 55)
+PLAYER_CARD_STAT_PROBE_VALUES = (11, 22, 0, 44, 55)
 
 
 def player_card_stat_probe() -> bool:
