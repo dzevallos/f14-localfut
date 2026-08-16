@@ -19,8 +19,8 @@ from patch_fifa14_fut_legends_db import (
 )
 
 KIT_TEAM_ID = 241
-STADIUM_ID = 34
-STADIUM_NAME = "Town Park"
+STADIUM_ID = 26
+STADIUM_NAME = "Forest Park"
 SAMPLE_PLAYER_IDS = (199575, 170114, 200376, 217787, 181381)
 
 

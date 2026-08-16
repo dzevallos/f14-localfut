@@ -31,7 +31,10 @@ SERVER_DIRECTORY = Path(__file__).resolve().parent
 if str(SERVER_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SERVER_DIRECTORY))
 
-from local_identity import LocalIdentityStore, PLAYER_CATALOG, PLAYER_BY_ASSET, PLAYER_REFERENCE_BY_ASSET
+from local_identity import (
+    LocalIdentityStore, PLAYER_CATALOG, PLAYER_BY_ASSET, PLAYER_REFERENCE_BY_ASSET,
+    apply_player_card_stat_probe, player_card_stat_probe,
+)
 from beta_identity import BetaIdentityStore
 
 
@@ -66,6 +69,12 @@ def build_fut_account_info_payload(account_mode: str = "new") -> bytes:
 
 
 def build_fut_json_payload(document: dict) -> bytes:
+    # FIFA14_PLAYER_STAT_PROBE rewrites every card's five-slot stat arrays to
+    # 11/22/33/44/55 on the way out, so one look at a card detail screen says
+    # which slot the client prints against which label (#12). Serialization is
+    # the only safe place for it: the store keeps the real totals.
+    if player_card_stat_probe():
+        document = apply_player_card_stat_probe(document)
     return (json.dumps(document, separators=(",", ":")) + "\n").encode("utf-8")
 
 
@@ -2121,6 +2130,32 @@ class HttpProbe(BaseHTTPRequestHandler):
             strings[f"LAbbr_{league_id}"] = short_name
         for nation_id, name in nations.items():
             strings[f"NationName_{nation_id}"] = name
+        # BETA 2.25.9 hotfix: carry the Store pack name/description tokens here
+        # as well, because this is the only localization document the client
+        # actually parses.
+        #
+        # A capture of the Store showed the offer parser consuming `name` and
+        # `description` from all 13 offers, yet the description panel rendered
+        # blank - the values are resolved as localization keys and the lookup
+        # produced nothing. The FUT locstrings parser hook fired exactly once in
+        # that session, for this 2,494-byte leaderboards document, and never for
+        # the 4,186-byte storepackdescriptions document that defines those pack
+        # tokens: FIFA downloads that file but does not feed it to this parser.
+        # Serving the tokens through the document that is parsed is what puts
+        # them in the table the offers are resolved against. The dedicated
+        # storepackdescriptions endpoint keeps serving them too.
+        try:
+            from local_identity import PACK_CATALOG_DOCUMENT
+            for entry in PACK_CATALOG_DOCUMENT.get("packs", []):
+                pack_type = int(entry.get("packType", 0))
+                pack_id = int(entry.get("packId", pack_type))
+                pack_name = str(entry.get("name", f"Local Pack {pack_type}"))
+                description = str(entry.get("description", "")) or pack_name
+                strings[f"LOCAL_PACK_NAME_{pack_type}"] = pack_name
+                strings[f"LOCAL_PACK_DESC_{pack_type}"] = description
+                strings[f"FUT_STORE_PACK_{pack_id}_DESC"] = description
+        except Exception:
+            pass
         return cls._locstrings_payload(strings, target="fut-leaderboards-locstrings")
 
     @staticmethod
@@ -2294,6 +2329,16 @@ class HttpProbe(BaseHTTPRequestHandler):
                     )
         except Exception:
             pass
+        # BETA 2.25.9 note: this document is currently inert. A traced Store
+        # visit showed FIFA fetching it 638 ms after the offers, exactly where
+        # the designed flow expects it, but the FUT locstrings parser never
+        # receives it - that hook fired only for leaderboards.ENG_US.xml.
+        # Adding the pack tokens to the leaderboards document (which IS parsed
+        # and accepted) did not resolve the labels either, so the Store resolves
+        # its offer strings against a table only this asset can fill, through a
+        # consumer we have not identified yet. Do not swap this format on a
+        # hunch: verify_fifa14_v237_install.py guards the source against the
+        # v2.40.13 trans-unit shape, which rendered visible NOT FOUND text.
         return cls._locstrings_payload(strings, target="storepackdescriptions")
 
     @staticmethod
@@ -3348,9 +3393,14 @@ class HttpProbe(BaseHTTPRequestHandler):
                         raise ValueError("missing consumable apply target")
                     resource_id = int(apply_match.group(1))
                     result = identity_store.apply_consumable(resource_id, target_ids)
-                    # Retail FUT's apply-consumable call is success-by-status; keep
-                    # the wire response empty/minimal and log the local mutation.
-                    response = {}
+                    # BETA 2.25.9 hotfix: the previous build answered with an
+                    # empty body. The mutation persisted, but the frontend had
+                    # no refreshed ItemData to re-bind, so an applied position
+                    # or training card looked like it had done nothing. Publish
+                    # the canonicalized cards the same way the other item routes
+                    # do; CardsDLL ignores the extra members it does not parse.
+                    changed_items = [row for row in result.get("itemData", []) if isinstance(row, dict)]
+                    response = {"itemData": changed_items}
                     status = 200
                     response_name = "local-consumable-apply-beta224"
                     emit(
@@ -3372,6 +3422,23 @@ class HttpProbe(BaseHTTPRequestHandler):
                         method=effective_method,
                         path=self.path,
                         reason=str(error),
+                    )
+                except Exception as error:
+                    # Anything that is not a request-shape error (sqlite3.Error,
+                    # KeyError from an off-catalogue asset, ...) previously
+                    # escaped the handler. socketserver then closed the socket
+                    # without any HTTP response at all, leaving the native
+                    # ActivateCard operation with no terminal status. Always
+                    # answer, and log only the exception class plus the numeric
+                    # ids that are already emitted on the success path.
+                    response = {"code": "500", "reason": "local consumable apply failed"}
+                    status = 500
+                    response_name = "local-consumable-apply-failure-beta2259"
+                    emit(
+                        "fut-local-consumable-apply-failure-beta2259",
+                        method=effective_method,
+                        path=self.path,
+                        error_type=type(error).__name__,
                     )
             elif (
                 path_without_query in {"/ut/game/fifa14/item", "/ut/game/fifa14/item/resource"}
@@ -3537,55 +3604,17 @@ class HttpProbe(BaseHTTPRequestHandler):
                 request = None
                 tail = path_without_query.rsplit("/", 1)[-1]
                 requested_id = int(tail) if tail.isdigit() else None
-                is_active_route = path_without_query.startswith("/ut/game/fifa14/squad/active")
-                if effective_method == "DELETE" and requested_id is not None and hasattr(identity_store, "delete_squad"):
-                    identity_store.delete_squad(requested_id)
-                    response = identity_store.squad_list_compact() if hasattr(identity_store, "squad_list_compact") else identity_store.squad_list()
-                    response_name = "squad-deleted-list"
-                    emit("fut-squad-deleted", path=self.path, squad_id=requested_id,
-                         remaining=[int(row.get("id", 0)) for row in response.get("squad", [])] if isinstance(response, dict) else [])
-                elif (
-                    is_active_route
-                    and requested_id is not None
-                    and effective_method in {"PUT", "POST"}
-                    and hasattr(identity_store, "set_active_squad")
-                ):
-                    # PUT /squad/active/{id} selects an existing squad without
-                    # rewriting any slot.
-                    identity_store.set_active_squad(requested_id)
-                    response = identity_store.squad_detail(requested_id) if hasattr(identity_store, "squad_detail") else identity_store.active_squad_document()
-                    response_name = "squad-active-selected"
-                elif effective_method in {"PUT", "POST"} and body:
+                if effective_method in {"PUT", "POST"} and body:
                     request = json.loads(body.decode("utf-8"))
-                    body_squad_id = 0
-                    if isinstance(request, dict):
-                        try:
-                            body_squad_id = int(request.get("squadId") or request.get("id") or 0)
-                        except (TypeError, ValueError):
-                            body_squad_id = 0
-                    if (
-                        effective_method == "POST"
-                        and path_without_query == "/ut/game/fifa14/squad"
-                        and requested_id is None
-                        and body_squad_id <= 0
-                        and hasattr(identity_store, "create_squad")
-                    ):
-                        # The squad hub creates an empty squad and copies an
-                        # existing one through this exact request: no path id and
-                        # id 0 in the body.
-                        response = identity_store.create_squad(request)
-                        response_name = "squad-created-detail"
-                        emit("fut-squad-created",
-                             path=self.path,
-                             squad_id=int(response.get("id", 0)) if isinstance(response, dict) else 0,
-                             squad_name=response.get("squadName") if isinstance(response, dict) else None)
-                    else:
-                        identity_store.save_squad(request, requested_id=requested_id)
-                        # Echo back the squad that was written, which is not always
-                        # the active one once more than one squad exists.
-                        detail_id = requested_id if requested_id else (body_squad_id or None)
-                        response = identity_store.squad_detail(detail_id) if hasattr(identity_store, "squad_detail") else identity_store.active_squad_document()
-                        response_name = "squad-saved-detail-beta222"
+                    saved = identity_store.save_squad(request, requested_id=requested_id)
+                    # POST /squad with "id":0 creates a squad. The frontend then
+                    # navigates by the id in this very response, so it has to be
+                    # the new squad's detail and not the active squad's.
+                    detail_id = requested_id
+                    if isinstance(saved, dict) and int(saved.get("createdSquadId", 0) or 0) > 0:
+                        detail_id = int(saved["createdSquadId"])
+                    response = identity_store.squad_detail(detail_id) if hasattr(identity_store, "squad_detail") else identity_store.active_squad_document()
+                    response_name = "squad-created-detail-beta2260" if detail_id != requested_id else "squad-saved-detail-beta222"
                 elif path_without_query == "/ut/game/fifa14/squad/list":
                     response = identity_store.squad_list_compact() if hasattr(identity_store, "squad_list_compact") else identity_store.squad_list()
                     response_name = "squad-list-compact-beta222"
@@ -3636,6 +3665,16 @@ class HttpProbe(BaseHTTPRequestHandler):
             emit("fut-http-response", method=self.command, effective_method=effective_method, path=self.path,
                  response_name="transfer-market-beta2250", status=200, bytes=len(payload),
                  auction_count=len(response.get("auctionInfo", [])), total=int(response.get("total", 0)))
+            # The consumable branch keys off the `type` token, and no capture of a
+            # non-player market search exists yet. Log what the client actually
+            # asks for so the vocabulary can be confirmed instead of inferred.
+            emit(
+                "fut-market-search-query-beta2260",
+                query={key: values[-1] if values else "" for key, values in query.items()},
+                type_token=(query.get("type") or [""])[-1],
+                served=len(response.get("auctionInfo", [])),
+                total=int(response.get("total", 0)),
+            )
         elif (
             getattr(self.server, "probe_name", "http") == "fut-http"
             and path_without_query in {"/ut/game/fifa14/tradePile", "/ut/game/fifa14/tradepile"}
@@ -4001,16 +4040,94 @@ class HttpProbe(BaseHTTPRequestHandler):
                 or path_without_query.startswith("/ut/game/fifa14/season/")
             )
         ):
+            # CardsDLLzf.dll builds these four routes from `ut/%s/season`,
+            # `ut/%s/season/user`, `ut/%s/season/%%s/user` and
+            # `ut/%s/season/%%s/reset`, where the inner `%%s` is `%d/division/%d`.
+            # BETA 2.26 answered every one of them with the season *list*, so the
+            # save the client PUTs before and after each fixture was accepted and
+            # discarded, and its own reload asked a question it never got an
+            # answer to.
+            season_save = re.fullmatch(
+                r"/ut/game/fifa14/season/(\d+)/division/(\d+)/user",
+                path_without_query, re.IGNORECASE,
+            )
+            season_reset = re.fullmatch(
+                r"/ut/game/fifa14/season/(\d+)(?:/division/(\d+))?/reset",
+                path_without_query, re.IGNORECASE,
+            )
             if identity_store is not None and hasattr(identity_store, "offline_seasons_list"):
                 if path_without_query == "/ut/game/fifa14/season/user":
                     response = identity_store.offline_season_user()
                     response_name = "fut-offline-season-user-beta2"
+                elif (
+                    path_without_query == "/ut/game/fifa14/season/user/history"
+                    and hasattr(identity_store, "offline_season_history")
+                ):
+                    response = identity_store.offline_season_history()
+                    response_name = "fut-offline-season-history-beta2261"
+                elif season_save is not None and hasattr(identity_store, "update_offline_season_user"):
+                    season_id = int(season_save.group(1))
+                    season_division = int(season_save.group(2))
+                    request_document: dict[str, Any] = {}
+                    if body:
+                        try:
+                            parsed = json.loads(body.decode("utf-8"))
+                            if isinstance(parsed, dict):
+                                request_document = parsed
+                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            request_document = {}
+                    if effective_method in {"PUT", "POST"}:
+                        response = identity_store.update_offline_season_user(
+                            season_id, season_division, request_document
+                        )
+                        response_name = "fut-offline-season-save-beta2261"
+                    else:
+                        response = identity_store.offline_season_load(season_id, season_division)
+                        response_name = "fut-offline-season-load-beta2261"
+                elif season_reset is not None and hasattr(identity_store, "reset_offline_season"):
+                    response = identity_store.reset_offline_season(
+                        int(season_reset.group(1)),
+                        int(season_reset.group(2) or 0),
+                    )
+                    response_name = "fut-offline-season-reset-beta2261"
                 else:
-                    response = identity_store.offline_seasons_list()
+                    # The screen names the divisions it wants (divisionList=11).
+                    season_query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                    try:
+                        response = identity_store.offline_seasons_list(season_query)
+                    except TypeError:
+                        response = identity_store.offline_seasons_list()
                     response_name = "fut-offline-seasons-beta2"
             else:
                 response = {"seasons": []}
                 response_name = "fut-seasons-empty"
+            # The 2026-08-16 capture proved the screen opens and asks for all of
+            # this; what it did not settle is who owns the offline division.
+            # `divisions` (what we served) next to `current_division` (where the
+            # club actually is) answers that on the next capture: if a promotion
+            # moves the number the screen asks for, the client follows season/user.
+            emit(
+                "fut-season-request-beta2260",
+                path=self.path,
+                method=effective_method,
+                response_name=response_name,
+                award_mode=os.environ.get("FIFA14_SEASON_AWARD_MODE", "native"),
+                seasons=len(response.get("seasons", [])) if isinstance(response, dict) else 0,
+                divisions=(
+                    [row.get("divisionId") for row in response.get("seasons", [])]
+                    if isinstance(response, dict) and isinstance(response.get("seasons"), list)
+                    else None
+                ),
+                current_division=(
+                    identity_store.current_season_division()
+                    if identity_store is not None and hasattr(identity_store, "current_season_division")
+                    else None
+                ),
+                first_award=(
+                    (response.get("seasons") or [{}])[0].get("prizeSet", [{}])[-1]
+                    if isinstance(response, dict) and response.get("seasons") else None
+                ),
+            )
             payload = build_fut_json_payload(response)
             self.send_response(200)
             self.send_header("content-type", "application/json; charset=utf-8")
@@ -4044,11 +4161,36 @@ class HttpProbe(BaseHTTPRequestHandler):
                         requested_count = int((query.get("count") or ["15"])[-1])
                     except (TypeError, ValueError):
                         requested_count = 15
+                    # CardsDLLzf.dll formats this as `/teams?groupId=%d&count=%d`
+                    # and groupId is the cup's aigroup, so it picks the tier of
+                    # opponents. No capture of this request exists yet, so log
+                    # what actually arrives instead of trusting the format string.
+                    requested_group: int | None = None
+                    for key in ("groupId", "groupid", "aigroup", "tournamentId"):
+                        for value in query.get(key, []):
+                            if str(value).strip().lstrip("-").isdigit():
+                                requested_group = int(str(value).strip())
+                                break
+                        if requested_group is not None:
+                            break
                     if hasattr(identity_store, "offline_tournament_teams"):
-                        response = identity_store.offline_tournament_teams(requested_count)
+                        try:
+                            response = identity_store.offline_tournament_teams(
+                                requested_count, group_id=requested_group
+                            )
+                        except TypeError:
+                            response = identity_store.offline_tournament_teams(requested_count)
                     else:
                         response = {"teamId": []}
                     response_name = "fut-offline-tournament-teams-beta28-native"
+                    emit(
+                        "fut-tournament-teams-group-beta2260",
+                        path=self.path,
+                        query={key: values[-1] if values else "" for key, values in query.items()},
+                        group_id=requested_group,
+                        count=requested_count,
+                        team_ids=response.get("teamId", []) if isinstance(response, dict) else [],
+                    )
                 elif path_without_query == "/ut/game/fifa14/tournament/user/list":
                     response = identity_store.offline_tournament_user_list()
                     response_name = f"fut-offline-tournament-user-beta28-{tournament_mode}"
@@ -4925,7 +5067,32 @@ def main() -> int:
         ssl_context, cert_temp, ca_path = create_tls_context(args.cert_hostname, args.cert_dir, args.cert_hash)
         redirector_handler = TlsTcpProbe
 
-    redirector = ReuseThreadingTCPServer((args.host, args.blaze_port), redirector_handler)
+    def bind_listener(factory, *, port: int, label: str):
+        """Construct a listener, or fail with an actionable message.
+
+        These listeners deliberately refuse address reuse, so a previous
+        probe.py that is still running - or a socket still in TIME_WAIT after
+        an abrupt exit - makes the bind fail. The bare OSError traceback that
+        used to surface here looked identical to a crash, while the game just
+        reported that the EA servers were down.
+        """
+        try:
+            return factory()
+        except OSError as error:
+            message = (
+                f"Cannot bind the {label} listener on {args.host}:{port} ({error.strerror or error}). "
+                "A previous FIFA 14 Local FUT server is probably still running, or the port has not "
+                "been released yet. Close the old server window (or wait ~4 minutes) and start again."
+            )
+            emit("listener-bind-failed", listener=label, host=args.host, port=port,
+                 errno=getattr(error, "errno", None))
+            print(message, file=sys.stderr, flush=True)
+            raise SystemExit(message) from error
+
+    redirector = bind_listener(
+        lambda: ReuseThreadingTCPServer((args.host, args.blaze_port), redirector_handler),
+        port=args.blaze_port, label="redirector",
+    )
     redirector.daemon_threads = True
     redirector.probe_name = "redirector"
     if args.redirector_mode == "tls":
@@ -4941,7 +5108,10 @@ def main() -> int:
                 args.cert_hostname, args.cert_dir, args.cert_hash
             )[0]
 
-    main_blaze = ReuseThreadingTCPServer((args.host, args.main_blaze_port), BlazeProbe)
+    main_blaze = bind_listener(
+        lambda: ReuseThreadingTCPServer((args.host, args.main_blaze_port), BlazeProbe),
+        port=args.main_blaze_port, label="main-blaze",
+    )
     main_blaze.daemon_threads = True
     main_blaze.probe_name = "main-blaze"
     main_blaze.origin_login_mode = args.origin_login_mode
@@ -4950,9 +5120,15 @@ def main() -> int:
     main_blaze.origin_login_delay_ms = max(0, args.origin_login_delay_ms)
     main_blaze.login_notification_delay_ms = max(0, args.login_notification_delay_ms)
     main_blaze.enable_fut_direct_boot_config = args.enable_fut_direct_boot_config
-    http = ExclusiveThreadingHTTPServer((args.host, args.http_port), HttpProbe)
+    http = bind_listener(
+        lambda: ExclusiveThreadingHTTPServer((args.host, args.http_port), HttpProbe),
+        port=args.http_port, label="bootstrap-http",
+    )
     http.probe_name = "bootstrap-http"
-    fut_http = ExclusiveThreadingHTTPServer((args.host, args.fut_http_port), HttpProbe)
+    fut_http = bind_listener(
+        lambda: ExclusiveThreadingHTTPServer((args.host, args.fut_http_port), HttpProbe),
+        port=args.fut_http_port, label="fut-http",
+    )
     fut_http.probe_name = "fut-http"
     fut_http.instance_token = args.instance_token
     fut_http.fut_account_mode = args.fut_account_mode
@@ -4971,9 +5147,9 @@ def main() -> int:
     servers = [redirector, main_blaze, http, fut_http]
     dynamic_http = None
     if args.dynamic_http_port > 0:
-        dynamic_http = ExclusiveThreadingHTTPServer(
-            (args.host, args.dynamic_http_port),
-            HttpProbe,
+        dynamic_http = bind_listener(
+            lambda: ExclusiveThreadingHTTPServer((args.host, args.dynamic_http_port), HttpProbe),
+            port=args.dynamic_http_port, label="dynamic-http",
         )
         dynamic_http.probe_name = "dynamic-http"
         servers.append(dynamic_http)

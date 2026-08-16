@@ -17,7 +17,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Prepare FIFA 14 Local FUT v2.41 BETA progression profile")
     parser.add_argument("--database", required=True)
     parser.add_argument("--reset", action="store_true")
-    parser.add_argument("--test-coins", type=int, default=0, help="Optional one-time developer coin float; normal friend/shared builds leave this at 0")
+    parser.add_argument("--test-coins", type=int, default=0, help="Optional developer coin float: top the club up to this balance. A club already at or above it is left alone. Normal friend/shared builds leave this at 0, and the launcher never passes it")
     args = parser.parse_args()
     db = Path(args.database)
     if args.reset and db.exists():

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import os
+import hashlib
 import json
 import math
 import random
 import re
 import sqlite3
+import sys
 import threading
 import time
 from contextlib import closing
@@ -13,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from fifa14_ids import definition_id_for, resource_id_for
+from fut_local_settings import load_settings as load_local_settings
 
 
 DEFAULT_NUCLEUS_ID = 1_000_001
@@ -30,6 +33,17 @@ MANAGER_CATALOG_PATH = Path(__file__).with_name("manager-catalog.v237.json")
 SPECIAL_CATALOG_PATH = Path(__file__).with_name("fifa14-special-catalog.v240.json")
 LEGEND_CATALOG_PATH = Path(__file__).with_name("fifa14-legend-catalog.v24013.json")
 CONSUMABLE_CATALOG_PATH = Path(__file__).with_name("fifa14-consumable-catalog.v2412.json")
+
+
+def _diagnostic(message: str) -> None:
+    """Write an operator-facing line without touching the JSON event stream.
+
+    probe.py's emit() prints one JSON document per line to stdout, and the
+    launcher redirects that stream straight into redirect-probe.log. Anything
+    printed to stdout from here would land in the middle of that log and break
+    every reader of it, so diagnostics go to stderr instead.
+    """
+    print(f"[local-identity] {message}", file=sys.stderr, flush=True)
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -78,6 +92,29 @@ TRANSFER_LIST_CAPACITY = 30
 MARKET_MAX_COPIES = 8
 MARKET_SYNTHETIC_RELIST_SECONDS = 15 * 60
 MARKET_SELL_TAX_RATE = 0.05
+# Rotating stock. The synthetic market is derived from the catalogue on every
+# search, so listing every card at once made all ~42,000 of them permanently
+# available. Instead each card is live only in some rotations: membership is a
+# hash of (resourceId, rotation index), which is stable for the whole window --
+# paging a search cannot shuffle underneath the client -- and needs no storage.
+# Raise the fraction for a scarcer market, set it to 1 to list everything again.
+MARKET_ROTATION_SECONDS = 30 * 60
+MARKET_ROTATION_FRACTION = 8
+# Consumables do not rotate: they are the shop counter, always stocked at a flat
+# price, so a position change or a chemistry style is never gated behind a wait.
+MARKET_CONSUMABLE_BUY_NOW = 500
+MARKET_CONSUMABLE_COPIES = 3
+MARKET_CONSUMABLE_TRADE_ID_BASE = 1_950_000_000
+MARKET_CONSUMABLE_ITEM_ID_BASE = 182_000_000_000
+# A user settings file may retune the market; the loader bounds every value and
+# anything it does not mention keeps the built-in above.
+_MARKET_SETTINGS = load_local_settings().get("market") or {}
+if "rotationFraction" in _MARKET_SETTINGS:
+    MARKET_ROTATION_FRACTION = int(_MARKET_SETTINGS["rotationFraction"])
+if "rotationMinutes" in _MARKET_SETTINGS:
+    MARKET_ROTATION_SECONDS = int(_MARKET_SETTINGS["rotationMinutes"]) * 60
+if "consumablePrice" in _MARKET_SETTINGS:
+    MARKET_CONSUMABLE_BUY_NOW = int(_MARKET_SETTINGS["consumablePrice"])
 
 def _market_listing_copies_for_card(player: dict[str, Any]) -> int:
     rating = int(player.get("rating", 0) or 0)
@@ -104,6 +141,87 @@ MARKET_RESOURCE_INDEX = {
 }
 MARKET_LIVE_LISTING_COUNT = sum(_market_listing_copies_for_card(player) for player in MARKET_PLAYER_CATALOG)
 
+# Only the consumables a user can actually buy and apply. The "Internal" rows
+# are the client's own hidden position/playstyle records, not shop stock.
+MARKET_CONSUMABLE_CATALOG = [
+    row for row in CONSUMABLE_CATALOG
+    if not str(row.get("category", "")).strip().casefold().startswith("internal")
+]
+MARKET_CONSUMABLE_INDEX = {
+    int(row.get("resourceId", 0) or 0): index
+    for index, row in enumerate(MARKET_CONSUMABLE_CATALOG)
+}
+# The type tokens the client uses for non-player searches. `club_items` already
+# proves this vocabulary against real captures; consumables are the two item
+# types the catalogue actually carries.
+MARKET_CONSUMABLE_TYPES = frozenset({"development", "training", "consumable", "consumables"})
+# The Club Items tab asks for everything equippable in one query rather than one
+# type at a time. `custom` is the badge family, as club_items already treats it.
+EQUIPPABLE_ITEM_TYPES = ("kit", "stadium", "custom", "ball")
+EQUIPPABLE_TYPE_ALIASES = frozenset({"equippables", "equippable", "clubitems", "club"})
+
+
+def _market_rotation_index(now: int) -> int:
+    """Which stock rotation the given moment falls in."""
+    return int(now) // max(1, MARKET_ROTATION_SECONDS)
+
+
+def _market_listing_order(resource_id: int, copy_index: int, rotation: int) -> int:
+    """A stable shuffle key for one listing within one rotation.
+
+    Sorting by rating made every page open with the best cards in the game, three
+    copies at a time, which reads as a leaderboard rather than a market
+    (dzevallos/f14-localfut#5). Ordering by a hash instead mixes the ratings and
+    separates copies of the same card, while staying identical for the whole
+    rotation so paging cannot shuffle underneath the client.
+    """
+    digest = hashlib.blake2b(
+        f"{int(rotation)}:{int(resource_id)}:{int(copy_index)}".encode("ascii"), digest_size=8
+    ).digest()
+    return int.from_bytes(digest, "big")
+
+
+def _market_listing_remaining(resource_id: int, copy_index: int, duration: int, now: int) -> int:
+    """Seconds left on one listing, as a real countdown.
+
+    BETA 2.26.1 (dzevallos/f14-localfut#13). `expires` used to be a constant out
+    of a five-value table, identical for the whole life of a listing, so "time
+    remaining" could not order anything and the market looked randomly shuffled.
+
+    Every listing now ends after the rotation it belongs to, staggered by a
+    per-card offset inside that card's own duration. Three properties matter, and
+    a per-second cycle -- the obvious implementation -- gets two of them wrong:
+
+    * the numbers tick down while the user browses, second by second;
+    * the *order* they impose is fixed for the whole rotation, so paging cannot
+      shuffle underneath the client. A continuously-cycling countdown re-sorted
+      the head of a 5,126-listing market every second, which is worse than the
+      shuffle it replaced;
+    * nothing expires mid-rotation, so the market never drains to empty. Stock
+      turning over is the rotation's job (`_market_card_in_rotation`).
+    """
+    duration = max(60, int(duration))
+    rotation_end = (_market_rotation_index(now) + 1) * max(1, MARKET_ROTATION_SECONDS)
+    digest = hashlib.blake2b(
+        f"expiry:{int(resource_id)}:{int(copy_index)}".encode("ascii"), digest_size=8
+    ).digest()
+    stagger = int.from_bytes(digest, "big") % duration
+    return max(60, rotation_end + stagger - int(now))
+
+
+def _market_card_in_rotation(resource_id: int, rotation: int) -> bool:
+    """Is this card part of the given rotation's stock?
+
+    Deterministic so the whole window agrees: two searches, or two pages of one
+    search, must never disagree about what is listed.
+    """
+    if MARKET_ROTATION_FRACTION <= 1:
+        return True
+    digest = hashlib.blake2b(
+        f"{int(resource_id)}:{int(rotation)}".encode("ascii"), digest_size=8
+    ).digest()
+    return int.from_bytes(digest, "big") % MARKET_ROTATION_FRACTION == 0
+
 PLAYER_ITEM_TYPE = "player"
 def player_card_subtype(rare_flag: int) -> int:
     """Retail player ``cardsubtypeid`` is a rare/common discriminator here.
@@ -119,8 +237,91 @@ def player_card_subtype(rare_flag: int) -> int:
     except (TypeError, ValueError):
         return 0
 PLAYER_STAT_COUNT = 5
+# Attributes are ratings and stop at 99; a career total does not.
+PLAYER_STAT_MAX = 9999
+# Which slot of a card's five-entry `statsList`/`lifetimeStats` array holds what
+# (dzevallos/f14-localfut#12: goals and games played never accumulated, because
+# nothing ever wrote either array -- the settle path put goals in a
+# `lifetimeGoals` member that is not in the client's JSON key table at all).
+#
+# The order below is an INFERENCE with a named test, not a recorded observation.
+# CardsDLLzf.dll lays its match-stat enum names out in reverse enum order -- the
+# table at 0x1afbbc..0x1afc54 reads OFFSIDES, RED_CARDS ... SHOTS_ON_TARGET while
+# the captured member order is goals, shotsOnTarget ... redCards, offsides -- and
+# applying that same reversal to the frontend's player block (0x191f10..0x191f68:
+# PLAYER_GAMESPLAYED, PLAYER_YELLOWCARDS, PLAYER_REDCARDS, PLAYER_ASSISTS,
+# PLAYER_GOALS) gives goals first. The two readings are exact opposites of each
+# other, so settle it in one look rather than argue: FIFA14_PLAYER_STAT_PROBE=1
+# serves 11/22/33/44/55 in slots 0..4 of every card, and whatever the card detail
+# screen prints against each label is the mapping.
+PLAYER_CARD_STAT_INDEX = {
+    "goals": 0,
+    "assists": 1,
+    "redCards": 2,
+    "yellowCards": 3,
+    "gamesPlayed": 4,
+}
+PLAYER_CARD_STAT_PROBE_VALUES = (11, 22, 33, 44, 55)
+
+
+def player_card_stat_probe() -> bool:
+    """Serve index-revealing sentinels instead of real per-card stats.
+
+    Settable two ways because one of them does not reach a normal launch: the
+    launcher relaunches itself elevated, and that drops environment variables set
+    in the user's shell. `diagnostics.playerStatProbe` in the settings file beside
+    the save survives it; the env var stays for a terminal run and wins when set.
+    """
+    raw = str(os.environ.get("FIFA14_PLAYER_STAT_PROBE", "")).strip().lower()
+    if raw:
+        return raw in {"1", "true", "yes", "on"}
+    try:
+        return bool((load_local_settings().get("diagnostics") or {}).get("playerStatProbe"))
+    except Exception:
+        return False
+
+
+def apply_player_card_stat_probe(document: Any) -> Any:
+    """Stamp the sentinels onto an outgoing document, leaving the store alone.
+
+    Applied at the serialization boundary on purpose. `_canonical_player_payload`
+    has twenty call sites and most of them write the result back to the items
+    table, so injecting sentinels there would persist them over the real career
+    totals -- a debug switch is not allowed to cost the user their stats.
+    """
+    if isinstance(document, dict):
+        result: dict[str, Any] = {}
+        for key, value in document.items():
+            if key in {"statsList", "lifetimeStats"} and isinstance(value, list):
+                result[key] = [
+                    {"index": index, "value": value_}
+                    for index, value_ in enumerate(PLAYER_CARD_STAT_PROBE_VALUES)
+                ]
+            elif key in {"statsArray", "lifetimeStatsArray"} and isinstance(value, list):
+                result[key] = list(PLAYER_CARD_STAT_PROBE_VALUES)
+            else:
+                result[key] = apply_player_card_stat_probe(value)
+        return result
+    if isinstance(document, list):
+        return [apply_player_card_stat_probe(row) for row in document]
+    return document
+
+
 PLAYER_ATTRIBUTE_COUNT = 6
 MIN_RECOGNIZED_SQUAD_PLAYERS = 7
+# A team FIFA cannot field eleven-a-side crashes its match builder, so the match
+# path never serves a squad below this. Squad *editing* is free to go lower.
+MIN_MATCH_SQUAD_PLAYERS = 11
+# Every position FIFA 14 can render on an outfield/GK card. A Positioning
+# consumable may only move a player between two of these; anything else is
+# rejected before the write so a malformed catalogue row cannot persist a
+# position the client has no template for.
+FIFA14_PLAYER_POSITIONS = frozenset({
+    "GK",
+    "CB", "LB", "RB", "LWB", "RWB",
+    "CDM", "CM", "CAM", "LM", "RM",
+    "LW", "RW", "LF", "RF", "CF", "ST",
+})
 FULL_PLAYER_SCHEMA = "fifa14-v237-capture-fixed-full-itemdata"
 FULL_CLUB_SEED_SCHEMA = "fifa14-v24018-duplicate-pairing"
 FULL_CLUB_ITEM_BASE = 171_000_000_000
@@ -140,6 +341,11 @@ class LocalIdentityStore:
     later launch can therefore use FIFA's returning-user path instead of
     repeating the captain tutorial or charity match.
     """
+
+    # ((rotation index, fraction), listing count) for the current market
+    # rotation. Shared: the rotation is a function of the clock and the
+    # catalogue, not of any one save.
+    _market_rotation_count_cache: tuple[tuple[int, int], int] | None = None
 
     def __init__(self, database: Path | str, initial_mode: str = "new") -> None:
         self.database = Path(database)
@@ -423,6 +629,9 @@ class LocalIdentityStore:
             # The launcher also runs the explicit migration/reporting pass.
             self._repair_owned_items_locked(connection, int(self._identity(connection)["persona_id"]))
             self._repair_active_squad_locked(connection, int(self._identity(connection)["persona_id"]))
+            # Existing progression databases predate the duplicate guard, so heal
+            # them once at startup rather than waiting for the next squad save.
+            self._clear_duplicate_squad_slots_locked(connection, int(self._identity(connection)["persona_id"]))
 
     def _identity(self, connection: sqlite3.Connection) -> sqlite3.Row:
         row = connection.execute("SELECT * FROM identity WHERE singleton = 1").fetchone()
@@ -1635,7 +1844,7 @@ class LocalIdentityStore:
         return max(minimum, min(maximum, number))
 
     @staticmethod
-    def _array_values(value: Any, size: int) -> list[int]:
+    def _array_values(value: Any, size: int, maximum: int = 99) -> list[int]:
         result = [0] * size
         if not isinstance(value, list):
             return result
@@ -1653,7 +1862,7 @@ class LocalIdentityStore:
                 except (TypeError, ValueError):
                     continue
             if 0 <= index < size:
-                result[index] = max(0, min(99, number))
+                result[index] = max(0, min(maximum, number))
         return result
 
     def _canonical_player_payload(
@@ -1729,9 +1938,13 @@ class LocalIdentityStore:
         )
         if not any(attributes):
             attributes = [rating] * PLAYER_ATTRIBUTE_COUNT
-        stats = self._array_values(source.get("statsList", source.get("statsArray", [])), PLAYER_STAT_COUNT)
+        stats = self._array_values(
+            source.get("statsList", source.get("statsArray", [])), PLAYER_STAT_COUNT,
+            maximum=PLAYER_STAT_MAX,
+        )
         lifetime_stats = self._array_values(
-            source.get("lifetimeStats", source.get("lifetimeStatsArray", [])), PLAYER_STAT_COUNT
+            source.get("lifetimeStats", source.get("lifetimeStatsArray", [])), PLAYER_STAT_COUNT,
+            maximum=PLAYER_STAT_MAX,
         )
 
         preferred_position = str(source.get("preferredPosition") or player.get("position") or "CM").upper()
@@ -1944,6 +2157,54 @@ class LocalIdentityStore:
             ),
         )
 
+    def _clear_duplicate_squad_slots_locked(
+        self, connection: sqlite3.Connection, persona_id: int
+    ) -> list[dict[str, int]]:
+        """Remove squad placements that repeat a footballer already in that squad.
+
+        FIFA 14 will not field the same player twice. Its match builder silently
+        drops the repeat, constructs that team with ten players, and then walks a
+        hard-coded 22-entry entity table -- reading the slot it never wrote. That
+        is an access violation inside fifa14.exe (observed at +0x1300840, reading
+        the 0xcdcdcdcd uninitialized-heap pattern), so the server cannot catch it
+        after the fact: the duplicate has to never reach a squad.
+
+        Only the later placement is cleared, so a duplicated starter keeps its
+        starting slot. The card itself is untouched and returns to My Club.
+        """
+        cleared: list[dict[str, int]] = []
+        for squad in connection.execute(
+            "SELECT squad_id FROM squads WHERE persona_id = ? ORDER BY squad_id", (int(persona_id),)
+        ).fetchall():
+            squad_id = int(squad["squad_id"])
+            kept_slot_for_asset: dict[int, int] = {}
+            for row in connection.execute(
+                "SELECT slot_index, item_id, asset_id FROM squad_players "
+                "WHERE squad_id = ? AND item_id > 0 ORDER BY slot_index",
+                (squad_id,),
+            ).fetchall():
+                asset_id = int(row["asset_id"])
+                slot_index = int(row["slot_index"])
+                if asset_id not in kept_slot_for_asset:
+                    kept_slot_for_asset[asset_id] = slot_index
+                    continue
+                self._write_squad_slot_locked(connection, squad_id, slot_index, None)
+                connection.execute(
+                    "UPDATE items SET pile = 'club' WHERE item_id = ? AND persona_id = ? AND pile = 'squad'",
+                    (int(row["item_id"]), int(persona_id)),
+                )
+                cleared.append({
+                    "squadId": squad_id, "slotIndex": slot_index,
+                    "itemId": int(row["item_id"]), "assetId": asset_id,
+                    "keptSlotIndex": kept_slot_for_asset[asset_id],
+                })
+        for entry in cleared:
+            _diagnostic(
+                "duplicate player cleared from squad {squadId}: slot {slotIndex} repeated assetId "
+                "{assetId} already in slot {keptSlotIndex}; the card is back in My Club".format(**entry)
+            )
+        return cleared
+
     def _repair_active_squad_locked(self, connection: sqlite3.Connection, persona_id: int) -> bool:
         fut_user = connection.execute(
             "SELECT active_squad_id FROM fut_users WHERE persona_id = ? AND active_squad_id IS NOT NULL",
@@ -1968,15 +2229,45 @@ class LocalIdentityStore:
             "ORDER BY CASE WHEN pile = 'squad' THEN 0 ELSE 1 END, item_id",
             (int(persona_id), PLAYER_ITEM_TYPE),
         ).fetchall()
-        if len(owned) < 11 or nonzero >= 11:
+        squads = int(connection.execute(
+            "SELECT COUNT(*) FROM squads WHERE persona_id = ?", (int(persona_id),)
+        ).fetchone()[0])
+        # This auto-fill exists to rescue the one bootstrap squad when its slots did
+        # not survive provisioning. Once the user keeps a second squad, a half-filled
+        # active squad is a squad they are still building -- refilling it from the
+        # club would overwrite their work on every single-player PUT.
+        if len(owned) < 11 or nonzero >= 11 or squads > 1:
             return False
         connection.execute("DELETE FROM squad_players WHERE squad_id = ?", (squad_id,))
+        # Auto-fill must not seed the squad with two cards of the same footballer:
+        # FIFA drops the repeat and fields ten players. Offer each asset once.
+        unique_owned: list[sqlite3.Row] = []
+        offered_assets: set[int] = set()
+        for candidate in owned:
+            asset_id = int(candidate["asset_id"])
+            if asset_id in offered_assets:
+                continue
+            offered_assets.add(asset_id)
+            unique_owned.append(candidate)
         used: set[int] = set()
+        skipped_slots = 0
         for slot_index in range(23):
-            item = owned[slot_index] if slot_index < len(owned) else None
-            self._write_squad_slot_locked(connection, squad_id, slot_index, item)
+            item = unique_owned[slot_index] if slot_index < len(unique_owned) else None
+            # This repair runs from __init__, before any listener is bound. One
+            # unrenderable card must never stop the whole server from starting,
+            # so drop the offending slot and continue.
+            try:
+                self._write_squad_slot_locked(connection, squad_id, slot_index, item)
+            except Exception:
+                skipped_slots += 1
+                self._write_squad_slot_locked(connection, squad_id, slot_index, None)
+                continue
             if item is not None:
                 used.add(int(item["item_id"]))
+        if skipped_slots:
+            _diagnostic(
+                f"squad repair emptied {skipped_slots} slot(s) whose card could not be canonicalized"
+            )
         for item in owned:
             item_id = int(item["item_id"])
             if item_id in used:
@@ -2580,6 +2871,13 @@ class LocalIdentityStore:
                 ).fetchone()
                 if row is None or str(row["item_type"]).lower() != PLAYER_ITEM_TYPE:
                     raise ValueError("consumable target is not an owned player")
+                # Canonicalizing an off-catalogue asset raises KeyError deep in
+                # _canonical_player. Reject it here as a normal request error so
+                # the caller answers 400 instead of dropping the connection.
+                if int(row["asset_id"]) not in PLAYER_REFERENCE_BY_ASSET:
+                    raise ValueError(
+                        f"consumable target assetId {int(row['asset_id'])} is not in the verified FIFA 14 catalogue"
+                    )
                 return row
 
             if category == "Fitness" and kind.casefold() == "squad":
@@ -2645,8 +2943,16 @@ class LocalIdentityStore:
                     if not match:
                         raise ValueError("position card has no valid transition")
                     old_pos, new_pos = match.group(1), match.group(2)
+                    # Validate both ends of the transition against the positions
+                    # FIFA 14 can actually render before touching the database.
+                    if old_pos not in FIFA14_PLAYER_POSITIONS or new_pos not in FIFA14_PLAYER_POSITIONS:
+                        raise ValueError(f"position card declares an unsupported transition {old_pos}->{new_pos}")
+                    if position not in FIFA14_PLAYER_POSITIONS:
+                        raise ValueError(f"target player has an unsupported stored position {position}")
                     if position != old_pos:
                         raise ValueError(f"position card requires {old_pos}, target is {position}")
+                    if new_pos == position:
+                        raise ValueError(f"target player is already {position}")
                     payload["preferredPosition"] = new_pos
                     effect = f"position {old_pos}->{new_pos}"
                 elif category == "Chemistry Style":
@@ -2936,8 +3242,14 @@ class LocalIdentityStore:
                 art_asset = tier_asset
             group_priority = tier_asset
             name = str(definition.get("name", f"Local Pack {pack_type}"))
+            description_text = str(definition.get("description", ""))
             name_token = f"LOCAL_PACK_NAME_{pack_type}"
             description_token = f"FUT_STORE_PACK_{pack_id}_DESC"
+            # Diagnostic override for the unresolved store-label question; see
+            # the name/description members below. Fails closed to the tokens.
+            literal_store_text = os.environ.get(
+                "FIFA14_STORE_TEXT_MODE", "token"
+            ).strip().lower() in {"literal", "prose", "text"}
 
             # Exact keys consumed by FutStoreGetPackTypesServerResponse's offer
             # parser.  The v2.40.9 retail Store APT capture proves that this
@@ -2959,13 +3271,24 @@ class LocalIdentityStore:
                     {"name": "coins", "funds": coins, "finalFunds": coins},
                     {"name": "points", "funds": points, "finalFunds": points},
                 ],
-                # Retail Store treats both name and description as localization keys.
-                # Supplying literal prose here resolves to the frontend's "*" missing-text marker.
-                "name": name_token,
-                # FIFA treats this member as a localization key, not literal
-                # prose. The corresponding locstring is served by the existing
-                # storepackdescriptions endpoint.
-                "description": description_token,
+                # Retail Store treats both name and description as localization
+                # keys, and an older build recorded that literal prose here
+                # resolved to the frontend's "*" missing-text marker.
+                #
+                # Against that, the Store's description panel - the only place
+                # either string is displayed - binds them straight to setText:
+                #   StoreDescPanelWC::_setPackText()
+                #     mHeader.text = packInfo.NAME ... DESCRIPTION ... setText
+                # with no ltxt/ION_Localization call, while the coins/points
+                # rows immediately after it do use ltxt. That asymmetry says the
+                # members are shown verbatim.
+                #
+                # Both readings cannot be tested from here, so the token contract
+                # stays the default and the literal experiment lives behind an
+                # explicit environment variable, exactly like the store art
+                # survey above. Set FIFA14_STORE_TEXT_MODE=literal to try it.
+                "name": name if literal_store_text else name_token,
+                "description": (description_text or name) if literal_store_text else description_token,
                 "nameToken": name_token,
                 "descriptionToken": description_token,
                 "displayGroup": {"priority": group_priority, "value": tier},
@@ -3607,6 +3930,29 @@ class LocalIdentityStore:
                 return {}
             return value if isinstance(value, dict) else {}
 
+    @staticmethod
+    def _market_rotation_listing_count(now: int) -> int:
+        """How many synthetic player listings this rotation carries.
+
+        Counting means hashing the whole catalogue, so keep the answer for the
+        rotation it belongs to -- the hub asks for it on every refresh.
+        """
+        rotation = _market_rotation_index(now)
+        cached = LocalIdentityStore._market_rotation_count_cache
+        # Keyed on the fraction too, so changing it (a test, or a retune between
+        # runs) cannot be answered from a cache built under the old setting.
+        if cached is not None and cached[0] == (rotation, MARKET_ROTATION_FRACTION):
+            return cached[1]
+        total = sum(
+            _market_listing_copies_for_card(player)
+            for player in MARKET_PLAYER_CATALOG
+            if _market_card_in_rotation(
+                int(player.get("resourceId", player.get("assetId", 0)) or 0), rotation
+            )
+        )
+        LocalIdentityStore._market_rotation_count_cache = ((rotation, MARKET_ROTATION_FRACTION), total)
+        return total
+
     def hub_data(self) -> dict[str, Any]:
         """Return the native FUT hub summary including the *whole* local market.
 
@@ -3638,7 +3984,11 @@ class LocalIdentityStore:
                 (persona_id,),
             ).fetchone()[0])
             user_total = user_live + user_sold
-            auction_count = max(0, MARKET_LIVE_LISTING_COUNT - recent_sold) + user_live
+            auction_count = (
+                max(0, self._market_rotation_listing_count(now) - recent_sold)
+                + user_live
+                + len(MARKET_CONSUMABLE_CATALOG) * MARKET_CONSUMABLE_COPIES
+            )
             return {
                 "auctionCount": int(auction_count),
                 "clubPlayers": club_players,
@@ -3851,6 +4201,13 @@ class LocalIdentityStore:
             preload_consumables: list[dict[str, Any]] = []
             player_request = requested_type in {"", "1", "player"}
             consumable_request = requested_type in {"consumable", "consumables"}
+            # "equippables" is the Club Items tab asking for everything the club
+            # can equip at once, captured as
+            # `/club?year=2014&type=equippables&level=any&count=11`. It was not in
+            # the recognised set, so the request fell through every branch and
+            # returned an empty page: the tab simply showed nothing, whatever was
+            # searched (dzevallos/f14-localfut#2).
+            equippable_request = requested_type in EQUIPPABLE_TYPE_ALIASES
             nonplayer_type = requested_type if requested_type in {
                 "development", "training", "kit", "stadium", "custom", "ball", "trophy"
             } else None
@@ -3906,13 +4263,21 @@ class LocalIdentityStore:
                         if resource_id not in CONSUMABLE_BY_RESOURCE:
                             continue
                         preload_consumables.append(consumable)
-            elif consumable_request or nonplayer_type is not None:
+            elif consumable_request or equippable_request or nonplayer_type is not None:
                 if consumable_request:
                     rows = connection.execute(
                         "SELECT payload FROM items WHERE persona_id=? "
                         "AND item_type IN ('development','training') "
                         "AND pile NOT IN ('trade','pending')",
                         (persona_id,),
+                    ).fetchall()
+                elif equippable_request:
+                    placeholders = ",".join("?" for _ in EQUIPPABLE_ITEM_TYPES)
+                    rows = connection.execute(
+                        f"SELECT payload FROM items WHERE persona_id = ? "
+                        f"AND item_type IN ({placeholders}) "
+                        f"AND pile NOT IN ('trade','pending') ORDER BY item_type, item_id",
+                        (persona_id, *EQUIPPABLE_ITEM_TYPES),
                     ).fetchall()
                 else:
                     rows = connection.execute(
@@ -4132,7 +4497,14 @@ class LocalIdentityStore:
         else:
             price = int(buy_now)
         start = int(starting_bid if starting_bid is not None else self._market_round_price(price * 0.82))
-        duration = int(duration if duration is not None else self._market_listing_duration(player, copy_index))
+        resource_for_cycle = int(player.get("resourceId", player.get("assetId", 0)) or 0)
+        if duration is None:
+            # A listing's own countdown, not the length it was posted for.
+            duration = _market_listing_remaining(
+                resource_for_cycle, copy_index,
+                self._market_listing_duration(player, copy_index), now,
+            )
+        duration = int(duration)
         item = item_payload if item_payload is not None else self._market_item_payload(player, copy_index)
         seller_names = ("FUT", "LegacyFC", "UltimateXI", "TradeKing", "OldSchoolUT", "MarketFC", "FootyClub", "RareGoldFC")
         resource = int(player.get("resourceId", player.get("assetId", 0)) or 0)
@@ -4262,14 +4634,53 @@ class LocalIdentityStore:
             sold_count += 1
         return sold_count
 
+    # Reported once per family per process: these tabs are asked for on every
+    # visit and the reason they are empty does not change within a session.
+    _market_unstocked_reported: set[str] = set()
+
+    @classmethod
+    def _market_unstocked_family(cls, requested_type: str, category: str) -> None:
+        """Say why a Transfer Market family has nothing in it (#11).
+
+        An unhandled query token returns an empty result rather than an error, so
+        every one of these reads as a broken tab. Two of them really were broken
+        (playerTraining and managerLeagueModifier, fixed in BETA 2.26.1); the rest
+        are empty for reasons worth stating out loud rather than leaving the
+        tester to file again.
+        """
+        key = f"{requested_type}:{category}".strip(":").casefold()
+        if key in cls._market_unstocked_reported:
+            return
+        cls._market_unstocked_reported.add(key)
+        reasons = {
+            "clubinfo": "the club already owns the whole shipped cosmetic catalogue "
+                        "(1,173 kits / 587 badges / 61 stadiums), so there is nothing left to sell it",
+            "stadium": "the club already owns all 61 shipped stadiums",
+            "ball": "no ball rows have been extracted from the client databases yet",
+            "staff": "manager-catalog.v237.json is reference metadata with liveEmissionEnabled=false; "
+                     "its resource IDs are unverified against this build and emitting them risks BUG-004 DB ERROR cards",
+        }
+        reason = reasons.get(str(requested_type).casefold(), "this build lists only players and consumables")
+        _diagnostic(
+            f"transfer market has no {requested_type}"
+            f"{'/' + category if category else ''} stock: {reason}"
+        )
+
     def market_search(self, query: dict[str, Any] | None = None) -> dict[str, Any]:
         query = query or {}
         requested_type = self._market_first(query, "type", default="player").lower()
+        if requested_type in MARKET_CONSUMABLE_TYPES:
+            return self._market_search_consumables(query, requested_type)
         if requested_type not in {"", "player", "1"}:
+            self._market_unstocked_family(requested_type, self._market_first(query, "cat", "category", default=""))
             return self.empty_auctions()
         definition = self._market_int(query, "definitionId", "maskedDefId")
         level = self._market_first(query, "lev", "level", default="any").lower()
+        # The search screen sends compound positions, captured as `pos=CAM-CF`
+        # for the attacking-midfield group. Comparing that as one literal string
+        # matched no card, so those searches returned nothing at all.
         position = self._market_first(query, "pos", "position", default="").upper()
+        positions = {part for part in re.split(r"[-,|]", position) if part} - {"ANY", "-1", ""}
         nation = self._market_int(query, "nat", "nation", default=-1)
         league = self._market_int(query, "leag", "league", default=-1)
         team = self._market_int(query, "team", "club", default=-1)
@@ -4295,10 +4706,15 @@ class LocalIdentityStore:
                 for row in connection.execute("SELECT trade_id FROM market_synthetic_sales WHERE sold_at>=?", (recent_cutoff,)).fetchall()
             }
 
+        rotation = _market_rotation_index(now)
         refs: list[tuple[dict[str, Any], int, int, int]] = []
         for player in MARKET_PLAYER_CATALOG:
             asset_id = int(player.get("assetId", 0) or 0)
             resource = int(player.get("resourceId", asset_id) or asset_id)
+            # Searching for one specific card still finds it if it is in stock;
+            # rotation decides what is listed, not how the query is answered.
+            if not _market_card_in_rotation(resource, rotation):
+                continue
             if definition not in (None, 0, -1) and int(definition) not in {asset_id, resource}:
                 continue
             quality = str(player.get("quality", self._quality_for_rating(int(player.get("rating", 0))))).lower()
@@ -4317,7 +4733,7 @@ class LocalIdentityStore:
                     continue
                 if rare_filter in {"sp","special"} and not special:
                     continue
-            if position not in {"", "ANY", "-1"} and str(player.get("position", "")).upper() != position:
+            if positions and str(player.get("position", "")).upper() not in positions:
                 continue
             if nation not in (None, -1, 0) and int(player.get("nation", -999)) != int(nation):
                 continue
@@ -4339,17 +4755,133 @@ class LocalIdentityStore:
                     continue
                 if max_bid and starting > max_bid:
                     continue
-                refs.append((player, copy_index, price, starting))
+                remaining = _market_listing_remaining(
+                    resource, copy_index, self._market_listing_duration(player, copy_index), now
+                )
+                refs.append((player, copy_index, price, starting, remaining))
 
-        refs.sort(key=lambda ref: (-int(ref[0].get("rating", 0)), ref[2], str(ref[0].get("name", "")), ref[1]))
+        # Closest to expiry first (dzevallos/f14-localfut#13). The rotation hash
+        # stays as the tie-break, so cards with the same countdown keep the mixed
+        # order that stopped every page opening on the best card in the game
+        # three copies at a time (#5), and paging cannot shuffle underneath the
+        # client within a second.
+        refs.sort(key=lambda ref: (
+            ref[4],
+            _market_listing_order(
+                int(ref[0].get("resourceId", ref[0].get("assetId", 0)) or 0), ref[1], rotation
+            ),
+        ))
         total = len(refs)
         page = refs[start:start + count]
         auctions = [
             self._market_auction(player, copy_index=copy_index, buy_now=price, starting_bid=starting,
-                                 trend_rows=trend_rows, now=now)
-            for player, copy_index, price, starting in page
+                                 duration=remaining, trend_rows=trend_rows, now=now)
+            for player, copy_index, price, starting, remaining in page
         ]
         return {"auctionInfo": auctions, "duplicateItemIdList": [], "total": total,
+                "credits": coins, "totalCredits": coins, "coins": coins}
+
+    @staticmethod
+    def _market_consumable_trade_id(definition: dict[str, Any], copy_index: int = 0) -> int:
+        index = MARKET_CONSUMABLE_INDEX[int(definition.get("resourceId", 0) or 0)]
+        return MARKET_CONSUMABLE_TRADE_ID_BASE + index * MARKET_CONSUMABLE_COPIES + int(copy_index)
+
+    @staticmethod
+    def _market_consumable_from_trade_id(trade_id: int) -> tuple[dict[str, Any], int] | None:
+        offset = int(trade_id) - MARKET_CONSUMABLE_TRADE_ID_BASE
+        if offset < 0:
+            return None
+        index, copy_index = divmod(offset, MARKET_CONSUMABLE_COPIES)
+        if index < 0 or index >= len(MARKET_CONSUMABLE_CATALOG):
+            return None
+        return MARKET_CONSUMABLE_CATALOG[index], copy_index
+
+    def _market_consumable_auction(self, definition: dict[str, Any], copy_index: int,
+                                   *, now: int) -> dict[str, Any]:
+        resource = int(definition.get("resourceId", 0) or 0)
+        index = MARKET_CONSUMABLE_INDEX[resource]
+        item = self._local_consumable_payload(
+            item_id=MARKET_CONSUMABLE_ITEM_ID_BASE + index * MARKET_CONSUMABLE_COPIES + int(copy_index),
+            consumable=definition,
+        )
+        item["pile"] = 0
+        item["itemState"] = "free"
+        return {
+            "tradeId": self._market_consumable_trade_id(definition, copy_index),
+            "tradeState": "active",
+            # A shop counter does not run out mid-browse. Keep the timer long and
+            # equal for every consumable so nothing is ever nearly-expired.
+            "expires": 3600, "EXPIRE_TIME": 3600, "expireTime": 3600,
+            "startTime": 0, "endtime": 2147483647,
+            "buyNowPrice": int(MARKET_CONSUMABLE_BUY_NOW),
+            "startingBid": int(MARKET_CONSUMABLE_BUY_NOW),
+            "currentBid": 0, "offers": 0, "watched": False, "bidState": "none",
+            "tradeOwner": False, "sellerName": "FUT", "sellerEstablished": 2013,
+            "sellerId": 1 + (resource % 999999), "confidenceValue": 100,
+            "itemData": item,
+        }
+
+    def _market_search_consumables(self, query: dict[str, Any], requested_type: str) -> dict[str, Any]:
+        """Every consumable, always in stock, at one flat Buy Now price.
+
+        Players rotate; consumables deliberately do not. Position changes and
+        chemistry styles are tools, and hiding them behind a rotation would make
+        the squad screen unusable for hours at a time.
+        """
+        wanted_item_type = requested_type if requested_type in {"development", "training"} else ""
+        # BETA 2.26.1: the query token has to go through the same normalizer as the
+        # catalogue name, or the two vocabularies never meet. The 2026-08-16 tester
+        # capture measures the gap exactly: `cat=GKTraining`, `cat=position` and
+        # `cat=playStyle` matched the catalogue verbatim and served 63/60/57, while
+        # `cat=playerTraining` (catalogue "Training", 21 cards) and
+        # `cat=managerLeagueModifier` (catalogue "Manager League", 8 cards) served
+        # nothing at all -- rule 7's unhandled token returning an empty result
+        # rather than an error, which reads as a missing feature
+        # (dzevallos/f14-localfut#11). The mapping already knew both spellings; it
+        # was only ever applied to one side of the comparison.
+        raw_category = self._market_first(query, "cat", "category", default="").strip()
+        category = self._consumable_filter_category({"category": raw_category})
+        if raw_category and not category:
+            # A real category we simply do not stock. Empty is the honest answer;
+            # dropping the filter would show contracts under a "kits" tab.
+            return self.empty_auctions()
+        min_buy = self._market_int(query, "micr", "minBuyNow", default=0) or 0
+        max_buy = self._market_int(query, "macr", "maxBuyNow", default=0) or 0
+        start = max(0, self._market_int(query, "start", "offset", "skip", default=0) or 0)
+        count = max(1, min(100, self._market_int(query, "num", "count", default=20) or 20))
+        now = int(time.time())
+        price = int(MARKET_CONSUMABLE_BUY_NOW)
+        if (min_buy and price < min_buy) or (max_buy and price > max_buy):
+            return self.empty_auctions()
+
+        with self._lock, closing(self._connect()) as connection:
+            identity = self._identity(connection)
+            club = connection.execute(
+                "SELECT coins FROM clubs WHERE persona_id=?", (int(identity["persona_id"]),)
+            ).fetchone()
+            coins = int(club["coins"]) if club is not None else 0
+
+        refs: list[tuple[dict[str, Any], int]] = []
+        for definition in MARKET_CONSUMABLE_CATALOG:
+            if wanted_item_type and str(definition.get("itemType", "")).lower() != wanted_item_type:
+                continue
+            if category and self._consumable_filter_category(definition) != category:
+                continue
+            for copy_index in range(MARKET_CONSUMABLE_COPIES):
+                refs.append((definition, copy_index))
+
+        # Copy index first: the opening page then shows one of every consumable
+        # instead of three rows of the same card, which is what makes browsing
+        # for a particular position change or chemistry style bearable.
+        refs.sort(key=lambda ref: (
+            ref[1], str(ref[0].get("category", "")), int(ref[0].get("resourceId", 0) or 0)
+        ))
+        page = refs[start:start + count]
+        auctions = [
+            self._market_consumable_auction(definition, copy_index, now=now)
+            for definition, copy_index in page
+        ]
+        return {"auctionInfo": auctions, "duplicateItemIdList": [], "total": len(refs),
                 "credits": coins, "totalCredits": coins, "coins": coins}
 
     def market_status(self, trade_ids: list[int]) -> dict[str, Any]:
@@ -4369,6 +4901,10 @@ class LocalIdentityStore:
                 for row in connection.execute("SELECT trade_id FROM market_synthetic_sales WHERE sold_at>=?", (recent_cutoff,)).fetchall()
             }
             for trade_id in wanted:
+                consumable = self._market_consumable_from_trade_id(trade_id)
+                if consumable is not None:
+                    auctions.append(self._market_consumable_auction(consumable[0], consumable[1], now=now))
+                    continue
                 decoded = self._market_from_trade_id(trade_id)
                 if decoded is not None and trade_id not in recent_sold:
                     player, copy_index = decoded
@@ -4396,9 +4932,61 @@ class LocalIdentityStore:
         return {"auctionInfo": auctions, "duplicateItemIdList": [], "total": len(auctions),
                 "credits": coins, "totalCredits": coins, "coins": coins}
 
+    def _market_bid_consumable(self, trade_id: int, amount: int,
+                               definition: dict[str, Any], copy_index: int) -> dict[str, Any]:
+        """Buy one consumable at the flat price.
+
+        No duplicate guard: unlike players, owning several contracts or chemistry
+        styles is the normal case, and the retail apply dialogs count them.
+        """
+        now = int(time.time())
+        price = int(MARKET_CONSUMABLE_BUY_NOW)
+        resource = int(definition.get("resourceId", 0) or 0)
+        item_type = str(definition.get("itemType", "development")).lower()
+        if item_type not in {"development", "training"}:
+            item_type = "development"
+        with self._lock, closing(self._connect()) as connection, connection:
+            identity = self._identity(connection)
+            persona_id = int(identity["persona_id"])
+            club = connection.execute("SELECT coins FROM clubs WHERE persona_id=?", (persona_id,)).fetchone()
+            coins = int(club["coins"]) if club is not None else 0
+            if amount <= 0:
+                amount = price
+            if amount < price:
+                listing = self._market_consumable_auction(definition, copy_index, now=now)
+                listing.update({"currentBid": amount, "offers": 1, "bidState": "outbid",
+                                "credits": coins, "totalCredits": coins, "coins": coins})
+                return listing
+            if price > coins:
+                return {"reason": "INSUFFICIENT_COINS", "tradeId": int(trade_id),
+                        "credits": coins, "totalCredits": coins, "coins": coins}
+            connection.execute("UPDATE clubs SET coins=coins-? WHERE persona_id=?", (price, persona_id))
+            next_id = int(connection.execute(
+                "SELECT COALESCE(MAX(item_id), ?) + 1 FROM items WHERE persona_id=?",
+                (PACK_ITEM_BASE, persona_id),
+            ).fetchone()[0])
+            payload = self._local_consumable_payload(item_id=next_id, consumable=definition)
+            payload["lastSalePrice"] = price
+            payload["itemState"] = "new"
+            connection.execute(
+                "INSERT INTO items(item_id,persona_id,asset_id,item_type,pile,tradeable,payload) "
+                "VALUES (?,?,?,?,'pending',1,?)",
+                (next_id, persona_id, resource, item_type,
+                 json.dumps(payload, separators=(",", ":"), ensure_ascii=False)),
+            )
+            coins -= price
+        listing = self._market_consumable_auction(definition, copy_index, now=now)
+        listing.update({"currentBid": amount, "offers": 0, "bidState": "highest",
+                        "tradeState": "closed", "itemData": payload,
+                        "credits": coins, "totalCredits": coins, "coins": coins})
+        return listing
+
     def market_bid(self, trade_id: int, amount: int) -> dict[str, Any]:
         trade_id = int(trade_id)
         amount = max(0, int(amount))
+        consumable = self._market_consumable_from_trade_id(trade_id)
+        if consumable is not None:
+            return self._market_bid_consumable(trade_id, amount, consumable[0], consumable[1])
         decoded = self._market_from_trade_id(trade_id)
         if decoded is None:
             return {"reason": "INVALID_REQUEST", "tradeId": trade_id}
@@ -4669,6 +5257,43 @@ class LocalIdentityStore:
     def empty_purchased_items(self) -> dict[str, Any]:
         return self.purchased_items()
 
+    def _rename_squad(
+        self, requested_id: int | None, document: dict[str, Any], squad_name: str
+    ) -> dict[str, Any]:
+        """Apply a name-only squad update without touching players or formation.
+
+        The squad selector renames through a PUT that carries no players array, so
+        this cannot go down the normal write path: that one rebuilds all 23 slots
+        from the (absent) array. Resolve the target the same way save_squad does --
+        the id in the path, else the id in the body, else the active squad.
+        """
+        with self._lock, closing(self._connect()) as connection, connection:
+            identity = self._identity(connection)
+            fut_user = self._ensure_fut_user_locked(connection)
+            persona_id = int(identity["persona_id"])
+            squad_id = int(requested_id or 0)
+            if squad_id <= 0:
+                try:
+                    squad_id = int(document.get("id", document.get("squadId", 0)) or 0)
+                except (TypeError, ValueError):
+                    squad_id = 0
+            if squad_id <= 0 and fut_user["active_squad_id"] is not None:
+                squad_id = int(fut_user["active_squad_id"])
+            row = connection.execute(
+                "SELECT squad_name FROM squads WHERE persona_id = ? AND squad_id = ?",
+                (persona_id, squad_id),
+            ).fetchone()
+            if row is None:
+                _diagnostic(f"rename ignored: squad {squad_id} does not exist")
+                return self.squad_list()
+            if str(row["squad_name"] or "") != squad_name:
+                connection.execute(
+                    "UPDATE squads SET squad_name = ? WHERE persona_id = ? AND squad_id = ?",
+                    (squad_name, persona_id, squad_id),
+                )
+                _diagnostic(f"squad {squad_id} renamed to {squad_name!r}")
+        return self.squad_list()
+
     def save_squad(self, document: dict[str, Any], requested_id: int | None = None) -> dict[str, Any]:
         """Persist retail PUT/POST /squad/{id} without allowing parser-corruption writes.
 
@@ -4677,43 +5302,43 @@ class LocalIdentityStore:
         loading the squad contained only the goalkeeper even though 22/23 slots were
         valid in the persistent DB.  Treat that specific sparse write as a refresh
         acknowledgement: keep the existing players *and* squad metadata verbatim.
+
+        A POST to /squad with no id in the path and an explicit "id":0 in the body is
+        the retail *create* call, not a write to the active squad.  It gets its own
+        INSERT and skips the sparse guard, which would otherwise re-activate the
+        existing squad and hand the frontend the wrong SquadDetails back.
         """
         if not isinstance(document, dict):
             raise ValueError("squad body must be a JSON object")
         players = document.get("players")
-        requested_id = self._document_squad_id(document, requested_id)
+        # An empty squadName means "unchanged": every retail PUT /squad/{id} in the
+        # BETA 2.25.9 capture omits the name, so coercing it would rename the squad
+        # on the next player swap.  Only a squad without a stored name falls back.
+        incoming_name = str(document.get("squadName") or "").strip()[:32]
         # The retail tournament handoff sends a partial captain/kicktakers PUT
-        # immediately before MatchReady. It intentionally contains no players array.
+        # immediately before MatchReady. It intentionally contains no players array
+        # (captured: keys id/captain/kicktakers), and dropping it is correct.
+        # A rename posts the same player-less shape but *does* carry squadName, and
+        # returning early swallowed it -- which is why renaming from the squad
+        # selector never stuck. Apply the metadata and leave the players alone.
         if players is None:
-            if requested_id > 0:
-                # The squad hub renames through the same players-less PUT, so
-                # apply whatever metadata it carries instead of dropping it.
-                self.update_squad_metadata(requested_id, document)
+            if incoming_name:
+                return self._rename_squad(requested_id, document, incoming_name)
             return self.squad_list()
         if not isinstance(players, list):
             raise ValueError("squad players must be an array")
-        # The squad editor's closing write carries all 23 slots and the formation
-        # but no squadName.  Every metadata member is therefore optional: an
-        # absent one keeps what the squad already has rather than reverting it to
-        # the historical default, which is what silently renamed squads back to
-        # "Local XI" as soon as the user left the editor.
-        requested_name = document.get("squadName")
-        requested_name = (
-            str(requested_name).strip()[:32]
-            if isinstance(requested_name, str) and str(requested_name).strip() else None
+        formation = str(document.get("formation") or "f442")
+        chemistry = self._bounded_int(document.get("chemistry", 0), 0, minimum=0, maximum=100)
+        star_rating = self._bounded_int(
+            document.get("starRating", document.get("rating", 0)), 0, minimum=0, maximum=100
         )
-        requested_formation = document.get("formation")
-        requested_formation = (
-            str(requested_formation).strip()
-            if isinstance(requested_formation, str) and str(requested_formation).strip() else None
-        )
-        requested_chemistry = document.get("chemistry") if "chemistry" in document else None
-        if "starRating" in document:
-            requested_rating = document.get("starRating")
-        elif "rating" in document:
-            requested_rating = document.get("rating")
-        else:
-            requested_rating = None
+        # Retail addresses an existing squad as PUT /squad/{id} and repeats that id
+        # in the body; only "Create New Squad"/"Copy Squad" post id 0.
+        try:
+            document_id = int(document.get("id", document.get("squadId", -1)) or 0)
+        except (TypeError, ValueError):
+            document_id = -1
+        creating = requested_id in (None, 0) and document_id == 0
 
         with self._lock, closing(self._connect()) as connection, connection:
             identity = self._identity(connection)
@@ -4721,13 +5346,22 @@ class LocalIdentityStore:
             persona_id = int(identity["persona_id"])
             self._repair_owned_items_locked(connection, persona_id)
             active_id = fut_user["active_squad_id"]
-            squad_id = requested_id if requested_id > 0 else (int(active_id) if active_id is not None else 0)
+            existing_squads = int(connection.execute(
+                "SELECT COUNT(*) FROM squads WHERE persona_id = ?", (persona_id,)
+            ).fetchone()[0])
             row = None
-            if squad_id > 0:
-                row = connection.execute(
-                    "SELECT squad_id,squad_name,formation,active,chemistry,star_rating FROM squads "
-                    "WHERE persona_id = ? AND squad_id = ?", (persona_id, squad_id)
-                ).fetchone()
+            squad_id = 0
+            if not creating:
+                squad_id = int(active_id) if requested_id in (None, 0) and active_id is not None else int(requested_id or 0)
+                if squad_id > 0:
+                    row = connection.execute(
+                        "SELECT squad_id,squad_name,formation,active,chemistry,star_rating FROM squads "
+                        "WHERE persona_id = ? AND squad_id = ?", (persona_id, squad_id)
+                    ).fetchone()
+            # A brand-new squad only takes over as the active one when it is the
+            # first squad this persona has.  Otherwise the club would go into its
+            # next match with the empty squad the user has not built yet.
+            activate = not (creating and existing_squads > 0)
             if row is None:
                 # Squads are created through POST /squad with a zero id.  A write
                 # naming an id this persona does not own is stale client state --
@@ -4740,20 +5374,16 @@ class LocalIdentityStore:
                 if owns_any is not None:
                     return self.squad_list()
                 cursor = connection.execute(
-                    "INSERT INTO squads (persona_id, squad_name, formation, active, chemistry, star_rating) VALUES (?, ?, ?, 0, ?, ?)",
-                    (
-                        persona_id,
-                        requested_name or "Local XI",
-                        requested_formation or "f442",
-                        self._bounded_int(requested_chemistry, 0, minimum=0, maximum=100),
-                        self._bounded_int(requested_rating, 0, minimum=0, maximum=100),
-                    ),
+                    "INSERT INTO squads (persona_id, squad_name, formation, active, chemistry, star_rating) VALUES (?, ?, ?, ?, ?, ?)",
+                    (persona_id, incoming_name or "Local XI", formation,
+                     1 if activate else 0, chemistry, star_rating),
                 )
                 squad_id = int(cursor.lastrowid)
                 row = connection.execute(
                     "SELECT squad_id,squad_name,formation,active,chemistry,star_rating FROM squads WHERE squad_id=?",
                     (squad_id,),
                 ).fetchone()
+            squad_name = incoming_name or str(row["squad_name"] or "Local XI")
 
             squad_name = requested_name or str(row["squad_name"] or "Local XI")
             formation = requested_formation or str(row["formation"] or "f442")
@@ -4801,107 +5431,102 @@ class LocalIdentityStore:
 
             existing_nonzero = sum(1 for value in existing_rows.values() if int(value["item_id"]) > 0)
             incoming_recognized = sum(1 for value in incoming.values() if value is not None)
-            sparse_legacy_write = existing_nonzero >= 11 and incoming_recognized < MIN_RECOGNIZED_SQUAD_PLAYERS
+            # A squad created by this very call has nothing to protect: an empty
+            # "Create New Squad" is the intended result, not a parser hiccup.
+            sparse_legacy_write = (
+                not creating
+                and existing_nonzero >= 11
+                and incoming_recognized < MIN_RECOGNIZED_SQUAD_PLAYERS
+            )
 
             if sparse_legacy_write:
                 # Do not let the transient GK-only/mostly-zero parser state destroy
                 # either the 23 slots or the known-good chemistry/rating/name.  Only
                 # reaffirm which existing squad is active and acknowledge the PUT.
-                self._set_active_squad_locked(connection, persona_id, squad_id, force=should_activate)
+                #
+                # One exception: the name. Every sparse write in the BETA 2.20/2.25.9
+                # captures carries an empty squadName, so a *non-empty* one is not
+                # part of the parser hiccup -- it is a rename the user typed, and
+                # swallowing it here is the other half of renames not sticking.
+                if incoming_name and incoming_name != str(row["squad_name"] or ""):
+                    connection.execute(
+                        "UPDATE squads SET squad_name = ? WHERE squad_id = ?",
+                        (incoming_name, squad_id),
+                    )
+                    _diagnostic(
+                        f"squad {squad_id} renamed to {incoming_name!r} on an otherwise sparse write"
+                    )
+                connection.execute("UPDATE squads SET active = 0 WHERE persona_id = ?", (persona_id,))
+                connection.execute("UPDATE squads SET active = 1 WHERE squad_id = ?", (squad_id,))
+                connection.execute(
+                    "UPDATE fut_users SET active_squad_id = ? WHERE persona_id = ?", (squad_id, persona_id)
+                )
                 connection.commit()
                 return self.squad_list()
 
+            if activate:
+                connection.execute("UPDATE squads SET active = 0 WHERE persona_id = ?", (persona_id,))
             connection.execute(
-                "UPDATE squads SET squad_name = ?, formation = ?, chemistry = ?, star_rating = ?, client_saved = 1 WHERE squad_id = ?",
-                (squad_name, formation, chemistry, star_rating, squad_id),
+                "UPDATE squads SET squad_name = ?, formation = ?, active = ?, chemistry = ?, star_rating = ? WHERE squad_id = ?",
+                (squad_name, formation, 1 if activate else 0, chemistry, star_rating, squad_id),
             )
             self._set_active_squad_locked(connection, persona_id, squad_id, force=should_activate)
             connection.execute("DELETE FROM squad_players WHERE squad_id = ?", (squad_id,))
+            placed_assets: set[int] = set()
+            rejected_duplicates: list[dict[str, int]] = []
             for index in range(23):
                 item = incoming.get(index)
                 kit_number = incoming_kit_numbers.get(index, 0)
+                if item is not None:
+                    asset_id = int(item["asset_id"])
+                    # Never persist the same footballer twice in one squad. FIFA
+                    # drops the repeat while building the match and then reads an
+                    # entity slot it never wrote, which crashes the client during
+                    # team setup. Leave the slot empty so the gap is visible in
+                    # the squad screen instead of storing an unplayable squad.
+                    if asset_id in placed_assets:
+                        rejected_duplicates.append(
+                            {"slotIndex": index, "itemId": int(item["item_id"]), "assetId": asset_id}
+                        )
+                        item = None
+                    else:
+                        placed_assets.add(asset_id)
                 self._write_squad_slot_locked(connection, squad_id, index, item, kit_number=kit_number)
+            for entry in rejected_duplicates:
+                _diagnostic(
+                    "duplicate player rejected on squad save: slot {slotIndex} repeated assetId "
+                    "{assetId}; the slot was left empty".format(**entry)
+                )
 
-            self._sync_player_piles_locked(connection, persona_id)
-        return self.squad_list()
-
-    def _sync_player_piles_locked(self, connection: sqlite3.Connection, persona_id: int) -> None:
-        """Mark owned players 'squad' when *any* squad fields them, 'club' otherwise.
-
-        Membership is deliberately evaluated across every squad the persona owns:
-        scoping it to the squad currently being written would demote the members
-        of all other squads back to My Club on each save.
-        """
-        squad_member_ids = {
-            int(row["item_id"])
-            for row in connection.execute(
-                "SELECT sp.item_id FROM squad_players sp JOIN squads s ON s.squad_id = sp.squad_id "
-                "WHERE s.persona_id = ? AND sp.item_id > 0",
-                (int(persona_id),),
-            ).fetchall()
-        }
-        for item_row in connection.execute(
-            "SELECT * FROM items WHERE persona_id = ? AND item_type = ? AND pile NOT IN ('trade','pending')", (persona_id, PLAYER_ITEM_TYPE)
-        ).fetchall():
-            item_id = int(item_row["item_id"])
-            if int(item_row["asset_id"]) not in PLAYER_REFERENCE_BY_ASSET:
-                continue
-            try:
-                existing_payload = json.loads(item_row["payload"] or "{}")
-            except (TypeError, json.JSONDecodeError):
-                existing_payload = {}
-            in_squad = item_id in squad_member_ids
-            payload = self._canonical_player_payload(
-                item_id=item_id, asset_id=int(item_row["asset_id"]),
-                existing=existing_payload if isinstance(existing_payload, dict) else {},
-                pile=7,
-            )
-            connection.execute(
-                "UPDATE items SET item_type = ?, pile = ?, payload = ? WHERE item_id = ? AND persona_id = ?",
-                (
-                    PLAYER_ITEM_TYPE, "squad" if in_squad else "club",
-                    json.dumps(payload, separators=(",", ":"), ensure_ascii=False),
-                    item_id, persona_id,
-                ),
-            )
-
-    @staticmethod
-    def _document_squad_id(document: dict[str, Any], requested_id: int | None) -> int:
-        """Resolve which squad a write targets: path id first, then body id.
-
-        Retail addresses a squad through PUT /squad/{id}; the squad hub also
-        echoes the id in the body.  Honouring both is what lets a client address
-        anything other than the single active squad.
-        """
-        for candidate in (requested_id, document.get("squadId"), document.get("id")):
-            try:
-                value = int(candidate)
-            except (TypeError, ValueError):
-                continue
-            if 0 < value <= 2_147_483_647:
-                return value
-        return 0
-
-    def _set_active_squad_locked(
-        self, connection: sqlite3.Connection, persona_id: int, squad_id: int, force: bool = True
-    ) -> None:
-        """Point the persona at one squad, leaving exactly one active row.
-
-        ``force=False`` only promotes the squad when nothing else is active, so
-        saving an unselected squad cannot steal the match squad from the one the
-        user actually picked.
-        """
-        if squad_id <= 0:
-            return
-        if not force:
-            other = connection.execute(
-                "SELECT squad_id FROM squads WHERE persona_id = ? AND active = 1 AND squad_id != ? ORDER BY squad_id LIMIT 1",
-                (int(persona_id), int(squad_id)),
-            ).fetchone()
-            if other is not None:
+            if activate:
                 connection.execute(
-                    "UPDATE squads SET active = 0 WHERE persona_id = ? AND squad_id = ?",
-                    (int(persona_id), int(squad_id)),
+                    "UPDATE fut_users SET active_squad_id = ? WHERE persona_id = ?", (squad_id, persona_id)
+                )
+            # A card can sit in more than one squad, so "is it in the club pile"
+            # has to be asked of every squad, not just the one being saved.
+            used_items = {
+                int(placement["item_id"]) for placement in connection.execute(
+                    "SELECT DISTINCT squad_players.item_id FROM squad_players "
+                    "JOIN squads ON squads.squad_id = squad_players.squad_id "
+                    "WHERE squads.persona_id = ? AND squad_players.item_id > 0",
+                    (persona_id,),
+                ).fetchall()
+            }
+            for item_row in connection.execute(
+                "SELECT * FROM items WHERE persona_id = ? AND item_type = ? AND pile NOT IN ('trade','pending')", (persona_id, PLAYER_ITEM_TYPE)
+            ).fetchall():
+                item_id = int(item_row["item_id"])
+                if int(item_row["asset_id"]) not in PLAYER_REFERENCE_BY_ASSET:
+                    continue
+                try:
+                    existing_payload = json.loads(item_row["payload"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    existing_payload = {}
+                in_squad = item_id in used_items
+                payload = self._canonical_player_payload(
+                    item_id=item_id, asset_id=int(item_row["asset_id"]),
+                    existing=existing_payload if isinstance(existing_payload, dict) else {},
+                    pile=7,
                 )
                 connection.execute(
                     "UPDATE fut_users SET active_squad_id = ? WHERE persona_id = ?",
@@ -5014,11 +5639,15 @@ class LocalIdentityStore:
                 connection.execute(
                     "DELETE FROM squads WHERE persona_id = ? AND squad_id = ?", (persona_id, int(squad_id))
                 )
-                if bool(target["active"]):
-                    remaining = [int(row["squad_id"]) for row in rows if int(row["squad_id"]) != int(squad_id)]
-                    self._set_active_squad_locked(connection, persona_id, remaining[0])
-                self._sync_player_piles_locked(connection, persona_id)
-        return self.squad_list()
+        listing = self.squad_list()
+        if creating:
+            # The frontend reads the id out of the SquadDetails it gets back and
+            # immediately GETs /squad/{id}; without this it would be handed the
+            # active squad and drop straight back to the squad selector.
+            listing = dict(listing)
+            listing["createdSquadId"] = squad_id
+            _diagnostic(f"created squad {squad_id} ({squad_name!r}) from POST /squad")
+        return listing
 
     def squad_list(self) -> dict[str, Any]:
         with self._lock, closing(self._connect()) as connection, connection:
@@ -5026,6 +5655,28 @@ class LocalIdentityStore:
             persona_id = int(identity["persona_id"])
             self._repair_owned_items_locked(connection, persona_id)
             self._repair_active_squad_locked(connection, persona_id)
+            # create_match serves its squad through this method, so sweeping here
+            # is what guarantees no duplicate can reach the native match builder,
+            # whichever code path put it in the squad.
+            self._clear_duplicate_squad_slots_locked(connection, persona_id)
+            # BETA 2.25.9 hotfix: the squad document is what /match returns to the
+            # native match loader, and FIFA itself always round-trips this member
+            # as a one-element array ("manager":[{"id":0}] when no manager is
+            # owned). Emitting an empty array left the loader indexing element 0
+            # of nothing, which read uninitialized heap during team setup.
+            manager_row = connection.execute(
+                "SELECT payload FROM items WHERE persona_id = ? AND item_type IN ('manager','staff') "
+                "ORDER BY item_id LIMIT 1",
+                (persona_id,),
+            ).fetchone()
+            manager_entry: dict[str, Any] = {"id": 0}
+            if manager_row is not None:
+                try:
+                    owned_manager = json.loads(manager_row["payload"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    owned_manager = {}
+                if isinstance(owned_manager, dict) and int(owned_manager.get("id", 0) or 0) > 0:
+                    manager_entry = owned_manager
             squads = []
             for row in connection.execute(
                 "SELECT squad_id, squad_name, formation, active, chemistry, star_rating FROM squads WHERE persona_id = ? ORDER BY squad_id",
@@ -5081,7 +5732,7 @@ class LocalIdentityStore:
                     "tactics": [],
                     "dreamSquad": False,
                     "custom": "",
-                    "manager": [],
+                    "manager": [dict(manager_entry)],
                     "actives": [],
                     "players": players,
                 })
@@ -5129,8 +5780,50 @@ class LocalIdentityStore:
         return dict(squads[0]) if squads else {}
 
     def active_squad_document(self) -> dict[str, Any]:
-        """Return the active native squad record used by CreateMatch."""
+        """Return the active native squad record the squad screens display."""
         return self.squad_detail(None)
+
+    def playable_squad_document(self) -> dict[str, Any]:
+        """Return a squad the native match builder can actually field.
+
+        FIFA builds both teams into a hard-coded 22-entry entity table and reads
+        every slot back, so a team it cannot fill eleven-a-side reads memory it
+        never wrote -- the access violation seen at fifa14.exe+0x1300840.  A
+        half-built squad is a legitimate state now that users can create squads,
+        so the match path falls back to the fullest squad that can field a side
+        rather than handing the client an incomplete one.
+        """
+        active = self.active_squad_document()
+        if self._squad_slots_filled(active) >= MIN_MATCH_SQUAD_PLAYERS:
+            return active
+        listing = self.squad_list()
+        squads = listing.get("squadList", listing.get("squad", [])) if isinstance(listing, dict) else []
+        best = max(
+            (squad for squad in squads if isinstance(squad, dict)),
+            key=self._squad_slots_filled,
+            default=None,
+        )
+        if best is None or self._squad_slots_filled(best) < MIN_MATCH_SQUAD_PLAYERS:
+            return active
+        _diagnostic(
+            "active squad {active} holds {filled} players; serving squad {fallback} to the match "
+            "builder instead so it can field eleven".format(
+                active=active.get("id") if isinstance(active, dict) else None,
+                filled=self._squad_slots_filled(active),
+                fallback=best.get("id"),
+            )
+        )
+        return self.squad_detail(int(best.get("id", best.get("squadId", 0)) or 0))
+
+    @staticmethod
+    def _squad_slots_filled(squad: Any) -> int:
+        if not isinstance(squad, dict):
+            return 0
+        return sum(
+            1 for row in squad.get("players", [])
+            if isinstance(row, dict) and isinstance(row.get("itemData"), dict)
+            and int(row["itemData"].get("id", row["itemData"].get("itemId", 0)) or 0) > 0
+        )
 
     def store_pack_quantities(self) -> dict[str, Any]:
         with self._lock, closing(self._connect()) as connection:
