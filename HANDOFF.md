@@ -182,6 +182,23 @@ the wallet, writes history and opens the next season one division up or down. Th
 is deliberately **lazy** (it happens on the next season read, not at settle) so the
 client's trailing round-11 write lands on the season it belongs to.
 
+*Fault 5 (the 0.4.2 crash, fixed).* Entering Seasons killed the client: access
+violation reading 0 at `CardsDLLzf+0xc66dd` (`cmp byte ptr [esi], 5`, esi = 0), one
+instruction into a callee whose caller passed a null straight through, immediately after
+the client parsed seasonId/divisionId/round. Making `season/user` report a seasonId that
+*resolves* to a served record is what did it: resolving sends the client into its resume
+path, which dereferences the season state it saved for itself, and a club that has never
+played a season has none.
+
+**The rule this establishes: never claim a current season without the client's own save
+to back it.** `_no_current_season_id()` (one past the ladder) is reported until
+`season_data` exists; the screen writes that save when it opens, before kickoff, so a
+season becomes resumable from the first visit on. The evidence is two-sided and was
+already in this file: BETA 2.26 served seasonId 2 against a list holding only id 1 -- not
+resolving -- and that is the single run where the screen opened and a match was played;
+the superseded tree served a resolving seasonId 1 and produced the menu bounce, then
+"seasons are currently unavailable", with crash dumps.
+
 **The one open question: who owns the offline division.** `GetUsersOfflineDivision` reads
 a member of the client's own season manager (vtable+0x28 of the singleton at
 `0x101d62d8`), and the season-list request copies its division vector straight out of that
