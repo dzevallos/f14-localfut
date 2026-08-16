@@ -127,7 +127,16 @@ def main() -> int:
 
         home = next(row for row in kit_inventory if int(row.get("assetId", -1)) == 14)
         away = next(row for row in kit_inventory if int(row.get("assetId", -1)) == 15)
-        stadium_card = next(row for row in stadium_inventory if int(row.get("assetId", -1)) == 34)
+        # The club's venue is configurable (`club.stadiumId`), so find the one the
+        # server actually resolved rather than Town Park's old literal 34.
+        starter_stadium_id = int(beta_identity_module._resolved_match_assets()["stadium"]["assetId"])
+        stadium_card = next(
+            (row for row in stadium_inventory if int(row.get("assetId", -1)) == starter_stadium_id),
+            None,
+        )
+        if stadium_card is None:
+            fail(f"the club does not own its own starter stadium {starter_stadium_id}: "
+                 f"{[row.get('assetId') for row in stadium_inventory]}")
 
         # BETA 2.13's guessed 5/7/8 cardsubtypeid + clubInfo experiment crashed
         # the retail PC client at kit-search response parse time. BETA 2.22 uses
@@ -140,7 +149,7 @@ def main() -> int:
             fail(f"home-kit retail classification lost: {home}")
         if int(away.get("category", -1)) != 3 or int(away.get("teamkittypetechid", -1)) != 1:
             fail(f"away-kit retail classification lost: {away}")
-        if int(stadium_card.get("category", -1)) != 4 or int(stadium_card.get("stadiumid", -1)) != 34:
+        if int(stadium_card.get("category", -1)) != 4 or int(stadium_card.get("stadiumid", -1)) != starter_stadium_id:
             fail(f"stadium retail classification lost: {stadium_card}")
         # category/teamkittypetechid/stadiumid are retail classification members
         # present in the BETA 2.14 response that rendered correctly.  FCC database
@@ -235,10 +244,25 @@ def main() -> int:
             fail(f"home kit must keep unique fcc carddbid 6300000 as resource identity: {active_by_state['activeHomeKit']}")
         if int(active_by_state["activeAwayKit"].get("resourceId", -1)) != 6400000:
             fail(f"away kit must keep unique fcc carddbid 6400000 as resource identity: {active_by_state['activeAwayKit']}")
-        if int(active_by_state["activeStadium"].get("assetId", 0)) != 34 or active_by_state["activeStadium"].get("itemType") != "stadium":
-            fail(f"native offline stadium fallback must remain Town Park ID 34: {active_by_state['activeStadium']}")
-        if int(active_by_state["activeStadium"].get("resourceId", -1)) != 6200016:
-            fail(f"Town Park must keep unique fcc carddbid 6200016 as resource identity: {active_by_state['activeStadium']}")
+        # The venue is a user setting (`club.stadiumId`), so pin the invariant
+        # rather than the number: the active stadium must be exactly the resolved
+        # starter stadium, id and fcc carddbid from the same row. Asserting "34
+        # and 6200016" instead would turn changing the setting into a game that
+        # will not boot, and asserting only the id would let a configured id be
+        # paired with Town Park's resource -- a venue the client cannot render,
+        # which is a crash rather than a wrong picture. Default stays Town Park
+        # ID 34 / carddbid 6200016.
+        resolved_stadium = beta_identity_module._resolved_match_assets()["stadium"]
+        expected_stadium_id = int(resolved_stadium.get("assetId", 34))
+        expected_resource = int(resolved_stadium.get("resourceId", 6200016))
+        active_stadium = active_by_state["activeStadium"]
+        if int(active_stadium.get("assetId", 0)) != expected_stadium_id or active_stadium.get("itemType") != "stadium":
+            fail(f"active stadium is not the resolved venue {expected_stadium_id}: {active_stadium}")
+        if int(active_stadium.get("resourceId", -1)) != expected_resource:
+            fail(f"stadium {expected_stadium_id} must keep its own fcc carddbid {expected_resource}, "
+                 f"not another venue's: {active_stadium}")
+        if int(active_stadium.get("stadiumid", active_stadium.get("StadiumId", -1))) != expected_stadium_id:
+            fail(f"stadium item id disagrees with its assetId: {active_stadium}")
         for cosmetic in actives:
             leaked = risky_wire_keys.intersection(cosmetic)
             if leaked:
@@ -330,6 +354,63 @@ def main() -> int:
         unknown = store.offline_seasons_list({"divisionList": ["99"]})
         if len(unknown["seasons"]) != len(season_rows):
             fail("an unknown division must fall back to the whole ladder, not an empty list")
+
+        # BETA 2.26.1 -- offline seasons persist and the ladder has real tiers.
+        #
+        # Every division used to schedule the same ten European giants, so the
+        # entry division opened against Barcelona/Real/Bayern; and the client's
+        # own save (PUT /season/<id>/division/<div>/user, captured 2026-08-16)
+        # was accepted and thrown away, so a played season never came back.
+        entry_teams = [int(m["teamId"]) for m in season_rows[0]["matches"]]
+        top_teams = [int(m["teamId"]) for m in season_rows[-1]["matches"]]
+        if set(entry_teams) & set(top_teams):
+            fail(f"entry and top division must not share opponents: {entry_teams} / {top_teams}")
+        if any(int(m["difficulty"]) < 1 or int(m["difficulty"]) > 5 for row in season_rows for m in row["matches"]):
+            fail("season fixture difficulty must stay inside the client's 0..5 AI ladder")
+        entry_hardest = max(int(m["difficulty"]) for m in season_rows[0]["matches"])
+        top_easiest = min(int(m["difficulty"]) for m in season_rows[-1]["matches"])
+        if entry_hardest >= top_easiest:
+            fail(f"the ladder must get harder: entry peaks at {entry_hardest}, top opens at {top_easiest}")
+        for row in season_rows:
+            pool = {int(m["teamId"]) for m in row["matches"]}
+            if not pool.issubset(valid_team_ids):
+                fail(f"division {row['divisionId']} schedules a club absent from the catalogue: {sorted(pool)}")
+
+        saved = store.update_offline_season_user(
+            1, store.entry_season_division(),
+            {"round": 2, "dataVersion": 1, "data": "QUJD", "progressDataVersion": 1, "progressData": "AwAAAAsIAA=="},
+        )
+        if list(saved) != ["round", "dataVersion", "data", "progressDataVersion", "progressData"]:
+            fail(f"a season save must be echoed in the client's own write order: {saved}")
+        resumed = store.offline_season_user()
+        if int(resumed["round"]) != 2 or resumed.get("data") != "QUJD":
+            fail(f"a saved season must come back underway at the round it saved: {resumed}")
+        if list(resumed).index("data") > list(resumed).index("dataVersion"):
+            fail(f"dataVersion decodes the buffer before it, so data must come first: {list(resumed)}")
+        if int(resumed["seasonId"]) != 1 or int(resumed["divisionId"]) != store.entry_season_division():
+            fail(f"a saved season must not move the club off its division: {resumed}")
+        # A save for a division the club is not in belongs to a finished season.
+        stale = store.update_offline_season_user(9, 3, {"round": 7, "dataVersion": 1, "data": "Wlpa"})
+        if int(store.offline_season_user()["divisionId"]) != store.entry_season_division():
+            fail(f"a season save for another division must not move the ladder: {stale}")
+        if os.environ.get("FIFA14_SEASON_SAVE_MODE"):
+            fail("FIFA14_SEASON_SAVE_MODE must not be set for the default contract")
+        os.environ["FIFA14_SEASON_SAVE_MODE"] = "round"
+        try:
+            minimal = store.offline_season_user()
+        finally:
+            os.environ.pop("FIFA14_SEASON_SAVE_MODE", None)
+        if set(minimal) != {"seasonId", "divisionId", "round"}:
+            fail(f"the round-only fallback must send exactly the three proven members: {minimal}")
+        if int(minimal["round"]) != 2:
+            fail(f"the round-only fallback must keep the saved round: {minimal}")
+        if store.offline_season_history() != {"seasons": []}:
+            fail("history must be empty until a season finishes, not a copy of the active list")
+        store.reset_offline_season(1, store.entry_season_division())
+        if store.offline_season_user() != {
+            "seasonId": 1, "divisionId": store.entry_season_division(), "round": 1
+        }:
+            fail(f"a season reset must return the club to round 1: {store.offline_season_user()}")
 
         # BETA 2.22 keeps the proven native PC tournament schema but exposes
         # four independent knockout cups. `rounds` remains an ARRAY; names are

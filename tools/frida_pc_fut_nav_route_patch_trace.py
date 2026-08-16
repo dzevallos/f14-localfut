@@ -4,6 +4,7 @@ import argparse
 import base64
 import json
 import sqlite3
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -182,7 +183,7 @@ const GET_STADIUM_ID_WRAPPER_RVA = 0x0007db70;
 const SET_ONLINE_STADIUM_ID_WRAPPER_RVA = 0x0007db90;
 const STADIUM_PROVIDER_GLOBAL_RVA = 0x001d70b0;
 const SCRIPT_INT_RETURN_RVA = 0x0001ab00;
-const LOCAL_OFFLINE_STADIUM_ID = 34;
+const LOCAL_OFFLINE_STADIUM_ID = __LOCAL_OFFLINE_STADIUM_ID__;
 // BETA 2.22: BETA 2.15 captured the exact native Make Active crash at
 // CardsDLL+0x1366ed. That instruction dereferences the first entry of an empty
 // ViewCards id vector. Trace the retail wrapper/path builders and repair only
@@ -1194,18 +1195,51 @@ function hookHostByName() {
 // Read it at the source. This is strings only: no backtrace, no memory probe, so
 // it costs a fraction of the JSON-key hook that stalled BETA 2.25.9 (rule 4), and
 // emit()'s per-kind cap bounds it if a match floods the channel.
+// BETA 2.26.1: OutputDebugString is not rare. The 2026-08-16 tester capture spent
+// its whole 1000-line budget in 17 seconds on two messages repeating per frame -
+// an unrecognised joystick ("unknown Device T.Flight Hotas One 2 trying Default
+// Pad") and the DLC loader's ActionPaused - which buried everything else and,
+// worse, drove the crash exception handler at the same rate (see
+// installCrashExceptionTrace). Collapse a repeat into a count instead of a line:
+// the client's account of a failure is still there, and the budget now lasts the
+// whole session rather than the first quarter-minute of it.
+let debugStringDepth = 0;
+let lastDebugString = null;
+let lastDebugStringRepeats = 0;
+function flushRepeatedDebugString() {
+  if (lastDebugStringRepeats > 0) {
+    emit('fifa-debug-string-repeat-beta2261', {text: lastDebugString, repeats: lastDebugStringRepeats});
+    lastDebugStringRepeats = 0;
+  }
+}
+function inDebugStringCall() { return debugStringDepth > 0; }
 function hookDebugOutput(name, wide) {
   const address = Module.findGlobalExportByName(name);
   if (address === null) { emit('fifa-debug-string-hook-missing-beta2260', {export: name}); return; }
-  Interceptor.attach(address, {onEnter(args) {
-    if (!emitBudgetLeft('fifa-debug-string-beta2260')) return;
-    let text = null;
-    try { text = wide ? utf16(args[0], 512) : cstring(args[0], 512); } catch (_) { return; }
-    if (text === null || text === undefined) return;
-    text = String(text).replace(/[\r\n]+$/, '');
-    if (!text.length) return;
-    emit('fifa-debug-string-beta2260', {export: name, text: text, thread_id: tid()});
-  }});
+  Interceptor.attach(address, {
+    onEnter(args) {
+      // Windows raises DBG_PRINTEXCEPTION_C from inside this call, so the depth
+      // has to be marked before anything else can bail out early.
+      debugStringDepth += 1;
+      if (!emitBudgetLeft('fifa-debug-string-beta2260')) return;
+      let text = null;
+      try { text = wide ? utf16(args[0], 512) : cstring(args[0], 512); } catch (_) { return; }
+      if (text === null || text === undefined) return;
+      text = String(text).replace(/[\r\n]+$/, '');
+      if (!text.length) return;
+      if (text === lastDebugString) {
+        lastDebugStringRepeats += 1;
+        // Report a long run periodically rather than only when it ends, so a
+        // message that repeats until the process dies still gets counted.
+        if (lastDebugStringRepeats % 250 === 0) flushRepeatedDebugString();
+        return;
+      }
+      flushRepeatedDebugString();
+      lastDebugString = text;
+      emit('fifa-debug-string-beta2260', {export: name, text: text, thread_id: tid()});
+    },
+    onLeave() { if (debugStringDepth > 0) debugStringDepth -= 1; }
+  });
 }
 function hookSend() {
   const address = Module.findGlobalExportByName('send');
@@ -1921,6 +1955,28 @@ function installCrashExceptionTrace() {
   crashExceptionTraceInstalled = true;
   try {
     Process.setExceptionHandler(function (details) {
+      // BETA 2.26.1, rule 4 applied to the exception handler. Every
+      // OutputDebugString call reaches Windows as a DBG_PRINTEXCEPTION_C system
+      // exception, so this handler was building a 32-frame ACCURATE backtrace
+      // plus a module lookup per frame for a message the debug-string hook had
+      // already read. In the 2026-08-16 tester capture that was ~26 exceptions a
+      // second for 38 seconds against a joystick the game does not recognise,
+      // and the game "frame rate lower than usual". The work also ran *after*
+      // the 1000-record cap, because the cap lives inside emit().
+      //
+      // Two guards, cheapest first: the depth flag the debug-string hook sets
+      // around its own call is exact (Windows raises from inside it, on this
+      // thread), and the budget check keeps any other flood bounded. A real
+      // fault -- access violation, illegal instruction, the int 3 an assert or
+      // BUG-006's memory exhaustion lands on -- is not a system exception and
+      // never passes through either guard.
+      if (inDebugStringCall()) return false;
+      if (!emitBudgetLeft('fifa14-native-exception-beta222')) {
+        // Let emit() publish its own one-shot suppression marker, then stop
+        // paying for backtraces we are no longer allowed to report.
+        emit('fifa14-native-exception-beta222', {type: details.type || null});
+        return false;
+      }
       let context = null;
       try {
         context = {
@@ -4288,7 +4344,26 @@ send({
         .replace("__CA_SIGNATURE__", _js_bytes(CA_FUNCTION_SIGNATURE))
         .replace("__UPDATE_SIGNATURE__", _js_bytes(UPDATE_SIGNATURE))
         .replace("__DISPATCH_SIGNATURE__", _js_bytes(SCREEN_EVENT_DISPATCHER_SIGNATURE))
+        .replace("__LOCAL_OFFLINE_STADIUM_ID__", str(_configured_offline_stadium_id()))
     )
+
+
+def _configured_offline_stadium_id(default: int = 26) -> int:
+    """The venue the agent forces onto the client's native stadium provider.
+
+    Read from the same settings file the server reads, because these two halves
+    disagreeing means the club's stadium and the one the match actually loads are
+    different venues. Never raises: the tracer runs inside the launcher, and the
+    launcher turns an exception into a window that closes with nothing shown.
+    """
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server"))
+        from fut_local_settings import load_settings
+
+        value = int((load_settings().get("club") or {}).get("stadiumId") or default)
+        return value if 1 <= value <= 300 else default
+    except Exception:
+        return default
 
 
 def main() -> int:

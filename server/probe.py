@@ -31,7 +31,10 @@ SERVER_DIRECTORY = Path(__file__).resolve().parent
 if str(SERVER_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SERVER_DIRECTORY))
 
-from local_identity import LocalIdentityStore, PLAYER_CATALOG, PLAYER_BY_ASSET, PLAYER_REFERENCE_BY_ASSET
+from local_identity import (
+    LocalIdentityStore, PLAYER_CATALOG, PLAYER_BY_ASSET, PLAYER_REFERENCE_BY_ASSET,
+    apply_player_card_stat_probe, player_card_stat_probe,
+)
 from beta_identity import BetaIdentityStore
 
 
@@ -66,6 +69,12 @@ def build_fut_account_info_payload(account_mode: str = "new") -> bytes:
 
 
 def build_fut_json_payload(document: dict) -> bytes:
+    # FIFA14_PLAYER_STAT_PROBE rewrites every card's five-slot stat arrays to
+    # 11/22/33/44/55 on the way out, so one look at a card detail screen says
+    # which slot the client prints against which label (#12). Serialization is
+    # the only safe place for it: the store keeps the real totals.
+    if player_card_stat_probe():
+        document = apply_player_card_stat_probe(document)
     return (json.dumps(document, separators=(",", ":")) + "\n").encode("utf-8")
 
 
@@ -3993,10 +4002,56 @@ class HttpProbe(BaseHTTPRequestHandler):
                 or path_without_query.startswith("/ut/game/fifa14/season/")
             )
         ):
+            # CardsDLLzf.dll builds these four routes from `ut/%s/season`,
+            # `ut/%s/season/user`, `ut/%s/season/%%s/user` and
+            # `ut/%s/season/%%s/reset`, where the inner `%%s` is `%d/division/%d`.
+            # BETA 2.26 answered every one of them with the season *list*, so the
+            # save the client PUTs before and after each fixture was accepted and
+            # discarded, and its own reload asked a question it never got an
+            # answer to.
+            season_save = re.fullmatch(
+                r"/ut/game/fifa14/season/(\d+)/division/(\d+)/user",
+                path_without_query, re.IGNORECASE,
+            )
+            season_reset = re.fullmatch(
+                r"/ut/game/fifa14/season/(\d+)(?:/division/(\d+))?/reset",
+                path_without_query, re.IGNORECASE,
+            )
             if identity_store is not None and hasattr(identity_store, "offline_seasons_list"):
                 if path_without_query == "/ut/game/fifa14/season/user":
                     response = identity_store.offline_season_user()
                     response_name = "fut-offline-season-user-beta2"
+                elif (
+                    path_without_query == "/ut/game/fifa14/season/user/history"
+                    and hasattr(identity_store, "offline_season_history")
+                ):
+                    response = identity_store.offline_season_history()
+                    response_name = "fut-offline-season-history-beta2261"
+                elif season_save is not None and hasattr(identity_store, "update_offline_season_user"):
+                    season_id = int(season_save.group(1))
+                    season_division = int(season_save.group(2))
+                    request_document: dict[str, Any] = {}
+                    if body:
+                        try:
+                            parsed = json.loads(body.decode("utf-8"))
+                            if isinstance(parsed, dict):
+                                request_document = parsed
+                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            request_document = {}
+                    if effective_method in {"PUT", "POST"}:
+                        response = identity_store.update_offline_season_user(
+                            season_id, season_division, request_document
+                        )
+                        response_name = "fut-offline-season-save-beta2261"
+                    else:
+                        response = identity_store.offline_season_load(season_id, season_division)
+                        response_name = "fut-offline-season-load-beta2261"
+                elif season_reset is not None and hasattr(identity_store, "reset_offline_season"):
+                    response = identity_store.reset_offline_season(
+                        int(season_reset.group(1)),
+                        int(season_reset.group(2) or 0),
+                    )
+                    response_name = "fut-offline-season-reset-beta2261"
                 else:
                     # The screen names the divisions it wants (divisionList=11).
                     season_query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
@@ -4008,10 +4063,11 @@ class HttpProbe(BaseHTTPRequestHandler):
             else:
                 response = {"seasons": []}
                 response_name = "fut-seasons-empty"
-            # Seasons has never worked and no capture of an attempt exists on this
-            # build, so record enough to tell the two candidate failures apart:
-            # the screen never asking at all, versus asking and then abandoning
-            # after the per-division award-item lookups (the BETA 2.3 finding).
+            # The 2026-08-16 capture proved the screen opens and asks for all of
+            # this; what it did not settle is who owns the offline division.
+            # `divisions` (what we served) next to `current_division` (where the
+            # club actually is) answers that on the next capture: if a promotion
+            # moves the number the screen asks for, the client follows season/user.
             emit(
                 "fut-season-request-beta2260",
                 path=self.path,
@@ -4019,6 +4075,16 @@ class HttpProbe(BaseHTTPRequestHandler):
                 response_name=response_name,
                 award_mode=os.environ.get("FIFA14_SEASON_AWARD_MODE", "native"),
                 seasons=len(response.get("seasons", [])) if isinstance(response, dict) else 0,
+                divisions=(
+                    [row.get("divisionId") for row in response.get("seasons", [])]
+                    if isinstance(response, dict) and isinstance(response.get("seasons"), list)
+                    else None
+                ),
+                current_division=(
+                    identity_store.current_season_division()
+                    if identity_store is not None and hasattr(identity_store, "current_season_division")
+                    else None
+                ),
                 first_award=(
                     (response.get("seasons") or [{}])[0].get("prizeSet", [{}])[-1]
                     if isinstance(response, dict) and response.get("seasons") else None

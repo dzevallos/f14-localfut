@@ -181,6 +181,34 @@ def _market_listing_order(resource_id: int, copy_index: int, rotation: int) -> i
     return int.from_bytes(digest, "big")
 
 
+def _market_listing_remaining(resource_id: int, copy_index: int, duration: int, now: int) -> int:
+    """Seconds left on one listing, as a real countdown.
+
+    BETA 2.26.1 (dzevallos/f14-localfut#13). `expires` used to be a constant out
+    of a five-value table, identical for the whole life of a listing, so "time
+    remaining" could not order anything and the market looked randomly shuffled.
+
+    Every listing now ends after the rotation it belongs to, staggered by a
+    per-card offset inside that card's own duration. Three properties matter, and
+    a per-second cycle -- the obvious implementation -- gets two of them wrong:
+
+    * the numbers tick down while the user browses, second by second;
+    * the *order* they impose is fixed for the whole rotation, so paging cannot
+      shuffle underneath the client. A continuously-cycling countdown re-sorted
+      the head of a 5,126-listing market every second, which is worse than the
+      shuffle it replaced;
+    * nothing expires mid-rotation, so the market never drains to empty. Stock
+      turning over is the rotation's job (`_market_card_in_rotation`).
+    """
+    duration = max(60, int(duration))
+    rotation_end = (_market_rotation_index(now) + 1) * max(1, MARKET_ROTATION_SECONDS)
+    digest = hashlib.blake2b(
+        f"expiry:{int(resource_id)}:{int(copy_index)}".encode("ascii"), digest_size=8
+    ).digest()
+    stagger = int.from_bytes(digest, "big") % duration
+    return max(60, rotation_end + stagger - int(now))
+
+
 def _market_card_in_rotation(resource_id: int, rotation: int) -> bool:
     """Is this card part of the given rotation's stock?
 
@@ -209,6 +237,64 @@ def player_card_subtype(rare_flag: int) -> int:
     except (TypeError, ValueError):
         return 0
 PLAYER_STAT_COUNT = 5
+# Attributes are ratings and stop at 99; a career total does not.
+PLAYER_STAT_MAX = 9999
+# Which slot of a card's five-entry `statsList`/`lifetimeStats` array holds what
+# (dzevallos/f14-localfut#12: goals and games played never accumulated, because
+# nothing ever wrote either array -- the settle path put goals in a
+# `lifetimeGoals` member that is not in the client's JSON key table at all).
+#
+# The order below is an INFERENCE with a named test, not a recorded observation.
+# CardsDLLzf.dll lays its match-stat enum names out in reverse enum order -- the
+# table at 0x1afbbc..0x1afc54 reads OFFSIDES, RED_CARDS ... SHOTS_ON_TARGET while
+# the captured member order is goals, shotsOnTarget ... redCards, offsides -- and
+# applying that same reversal to the frontend's player block (0x191f10..0x191f68:
+# PLAYER_GAMESPLAYED, PLAYER_YELLOWCARDS, PLAYER_REDCARDS, PLAYER_ASSISTS,
+# PLAYER_GOALS) gives goals first. The two readings are exact opposites of each
+# other, so settle it in one look rather than argue: FIFA14_PLAYER_STAT_PROBE=1
+# serves 11/22/33/44/55 in slots 0..4 of every card, and whatever the card detail
+# screen prints against each label is the mapping.
+PLAYER_CARD_STAT_INDEX = {
+    "goals": 0,
+    "assists": 1,
+    "redCards": 2,
+    "yellowCards": 3,
+    "gamesPlayed": 4,
+}
+PLAYER_CARD_STAT_PROBE_VALUES = (11, 22, 33, 44, 55)
+
+
+def player_card_stat_probe() -> bool:
+    """Serve index-revealing sentinels instead of real per-card stats."""
+    return str(os.environ.get("FIFA14_PLAYER_STAT_PROBE", "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def apply_player_card_stat_probe(document: Any) -> Any:
+    """Stamp the sentinels onto an outgoing document, leaving the store alone.
+
+    Applied at the serialization boundary on purpose. `_canonical_player_payload`
+    has twenty call sites and most of them write the result back to the items
+    table, so injecting sentinels there would persist them over the real career
+    totals -- a debug switch is not allowed to cost the user their stats.
+    """
+    if isinstance(document, dict):
+        result: dict[str, Any] = {}
+        for key, value in document.items():
+            if key in {"statsList", "lifetimeStats"} and isinstance(value, list):
+                result[key] = [
+                    {"index": index, "value": value_}
+                    for index, value_ in enumerate(PLAYER_CARD_STAT_PROBE_VALUES)
+                ]
+            elif key in {"statsArray", "lifetimeStatsArray"} and isinstance(value, list):
+                result[key] = list(PLAYER_CARD_STAT_PROBE_VALUES)
+            else:
+                result[key] = apply_player_card_stat_probe(value)
+        return result
+    if isinstance(document, list):
+        return [apply_player_card_stat_probe(row) for row in document]
+    return document
+
+
 PLAYER_ATTRIBUTE_COUNT = 6
 MIN_RECOGNIZED_SQUAD_PLAYERS = 7
 # A team FIFA cannot field eleven-a-side crashes its match builder, so the match
@@ -1741,7 +1827,7 @@ class LocalIdentityStore:
         return max(minimum, min(maximum, number))
 
     @staticmethod
-    def _array_values(value: Any, size: int) -> list[int]:
+    def _array_values(value: Any, size: int, maximum: int = 99) -> list[int]:
         result = [0] * size
         if not isinstance(value, list):
             return result
@@ -1759,7 +1845,7 @@ class LocalIdentityStore:
                 except (TypeError, ValueError):
                     continue
             if 0 <= index < size:
-                result[index] = max(0, min(99, number))
+                result[index] = max(0, min(maximum, number))
         return result
 
     def _canonical_player_payload(
@@ -1835,9 +1921,13 @@ class LocalIdentityStore:
         )
         if not any(attributes):
             attributes = [rating] * PLAYER_ATTRIBUTE_COUNT
-        stats = self._array_values(source.get("statsList", source.get("statsArray", [])), PLAYER_STAT_COUNT)
+        stats = self._array_values(
+            source.get("statsList", source.get("statsArray", [])), PLAYER_STAT_COUNT,
+            maximum=PLAYER_STAT_MAX,
+        )
         lifetime_stats = self._array_values(
-            source.get("lifetimeStats", source.get("lifetimeStatsArray", [])), PLAYER_STAT_COUNT
+            source.get("lifetimeStats", source.get("lifetimeStatsArray", [])), PLAYER_STAT_COUNT,
+            maximum=PLAYER_STAT_MAX,
         )
 
         preferred_position = str(source.get("preferredPosition") or player.get("position") or "CM").upper()
@@ -4382,7 +4472,14 @@ class LocalIdentityStore:
         else:
             price = int(buy_now)
         start = int(starting_bid if starting_bid is not None else self._market_round_price(price * 0.82))
-        duration = int(duration if duration is not None else self._market_listing_duration(player, copy_index))
+        resource_for_cycle = int(player.get("resourceId", player.get("assetId", 0)) or 0)
+        if duration is None:
+            # A listing's own countdown, not the length it was posted for.
+            duration = _market_listing_remaining(
+                resource_for_cycle, copy_index,
+                self._market_listing_duration(player, copy_index), now,
+            )
+        duration = int(duration)
         item = item_payload if item_payload is not None else self._market_item_payload(player, copy_index)
         seller_names = ("FUT", "LegacyFC", "UltimateXI", "TradeKing", "OldSchoolUT", "MarketFC", "FootyClub", "RareGoldFC")
         resource = int(player.get("resourceId", player.get("assetId", 0)) or 0)
@@ -4512,12 +4609,45 @@ class LocalIdentityStore:
             sold_count += 1
         return sold_count
 
+    # Reported once per family per process: these tabs are asked for on every
+    # visit and the reason they are empty does not change within a session.
+    _market_unstocked_reported: set[str] = set()
+
+    @classmethod
+    def _market_unstocked_family(cls, requested_type: str, category: str) -> None:
+        """Say why a Transfer Market family has nothing in it (#11).
+
+        An unhandled query token returns an empty result rather than an error, so
+        every one of these reads as a broken tab. Two of them really were broken
+        (playerTraining and managerLeagueModifier, fixed in BETA 2.26.1); the rest
+        are empty for reasons worth stating out loud rather than leaving the
+        tester to file again.
+        """
+        key = f"{requested_type}:{category}".strip(":").casefold()
+        if key in cls._market_unstocked_reported:
+            return
+        cls._market_unstocked_reported.add(key)
+        reasons = {
+            "clubinfo": "the club already owns the whole shipped cosmetic catalogue "
+                        "(1,173 kits / 587 badges / 61 stadiums), so there is nothing left to sell it",
+            "stadium": "the club already owns all 61 shipped stadiums",
+            "ball": "no ball rows have been extracted from the client databases yet",
+            "staff": "manager-catalog.v237.json is reference metadata with liveEmissionEnabled=false; "
+                     "its resource IDs are unverified against this build and emitting them risks BUG-004 DB ERROR cards",
+        }
+        reason = reasons.get(str(requested_type).casefold(), "this build lists only players and consumables")
+        _diagnostic(
+            f"transfer market has no {requested_type}"
+            f"{'/' + category if category else ''} stock: {reason}"
+        )
+
     def market_search(self, query: dict[str, Any] | None = None) -> dict[str, Any]:
         query = query or {}
         requested_type = self._market_first(query, "type", default="player").lower()
         if requested_type in MARKET_CONSUMABLE_TYPES:
             return self._market_search_consumables(query, requested_type)
         if requested_type not in {"", "player", "1"}:
+            self._market_unstocked_family(requested_type, self._market_first(query, "cat", "category", default=""))
             return self.empty_auctions()
         definition = self._market_int(query, "definitionId", "maskedDefId")
         level = self._market_first(query, "lev", "level", default="any").lower()
@@ -4600,17 +4730,28 @@ class LocalIdentityStore:
                     continue
                 if max_bid and starting > max_bid:
                     continue
-                refs.append((player, copy_index, price, starting))
+                remaining = _market_listing_remaining(
+                    resource, copy_index, self._market_listing_duration(player, copy_index), now
+                )
+                refs.append((player, copy_index, price, starting, remaining))
 
-        refs.sort(key=lambda ref: _market_listing_order(
-            int(ref[0].get("resourceId", ref[0].get("assetId", 0)) or 0), ref[1], rotation
+        # Closest to expiry first (dzevallos/f14-localfut#13). The rotation hash
+        # stays as the tie-break, so cards with the same countdown keep the mixed
+        # order that stopped every page opening on the best card in the game
+        # three copies at a time (#5), and paging cannot shuffle underneath the
+        # client within a second.
+        refs.sort(key=lambda ref: (
+            ref[4],
+            _market_listing_order(
+                int(ref[0].get("resourceId", ref[0].get("assetId", 0)) or 0), ref[1], rotation
+            ),
         ))
         total = len(refs)
         page = refs[start:start + count]
         auctions = [
             self._market_auction(player, copy_index=copy_index, buy_now=price, starting_bid=starting,
-                                 trend_rows=trend_rows, now=now)
-            for player, copy_index, price, starting in page
+                                 duration=remaining, trend_rows=trend_rows, now=now)
+            for player, copy_index, price, starting, remaining in page
         ]
         return {"auctionInfo": auctions, "duplicateItemIdList": [], "total": total,
                 "credits": coins, "totalCredits": coins, "coins": coins}
@@ -4663,7 +4804,22 @@ class LocalIdentityStore:
         the squad screen unusable for hours at a time.
         """
         wanted_item_type = requested_type if requested_type in {"development", "training"} else ""
-        category = self._market_first(query, "cat", "category", default="").strip().casefold()
+        # BETA 2.26.1: the query token has to go through the same normalizer as the
+        # catalogue name, or the two vocabularies never meet. The 2026-08-16 tester
+        # capture measures the gap exactly: `cat=GKTraining`, `cat=position` and
+        # `cat=playStyle` matched the catalogue verbatim and served 63/60/57, while
+        # `cat=playerTraining` (catalogue "Training", 21 cards) and
+        # `cat=managerLeagueModifier` (catalogue "Manager League", 8 cards) served
+        # nothing at all -- rule 7's unhandled token returning an empty result
+        # rather than an error, which reads as a missing feature
+        # (dzevallos/f14-localfut#11). The mapping already knew both spellings; it
+        # was only ever applied to one side of the comparison.
+        raw_category = self._market_first(query, "cat", "category", default="").strip()
+        category = self._consumable_filter_category({"category": raw_category})
+        if raw_category and not category:
+            # A real category we simply do not stock. Empty is the honest answer;
+            # dropping the filter would show contracts under a "kits" tab.
+            return self.empty_auctions()
         min_buy = self._market_int(query, "micr", "minBuyNow", default=0) or 0
         max_buy = self._market_int(query, "macr", "maxBuyNow", default=0) or 0
         start = max(0, self._market_int(query, "start", "offset", "skip", default=0) or 0)

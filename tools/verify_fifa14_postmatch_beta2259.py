@@ -184,6 +184,57 @@ def main() -> int:
         require(store.offline_tournament_user_list().get("tournamentId") == [],
                 "loss did not reset knockout resume state")
 
+        # BETA 2.26.1 (dzevallos/f14-localfut#12): a card's own stats accumulate.
+        # The client parses statsList/lifetimeStats; the settle path used to put
+        # goals in `lifetimeGoals`, which is not a member the client knows, so
+        # every card stayed on zero no matter how many matches it played.
+        squad = store.active_squad_document()
+        eleven = [int(row["itemData"]["id"]) for row in squad["players"][:11]]
+        scorer = eleven[0]
+        reserve = int(squad["players"][15]["itemData"]["id"])
+
+        def card_stats(item_id: int) -> list[int]:
+            for row in store.active_squad_document()["players"]:
+                if int(row["itemData"]["id"]) == item_id:
+                    return [int(entry["value"]) for entry in row["itemData"]["statsList"]]
+            raise SystemExit(f"card {item_id} vanished from the squad")
+
+        require(card_stats(scorer) == [0] * 5, f"a fresh card must start on zeroes: {card_stats(scorer)}")
+        store.create_match({"squadId": 1, "type": "OFFLINE"})
+        store.match_ready({"items": [{"id": item_id} for item_id in eleven]})
+        stat_items = [{"id": item_id} for item_id in eleven] + [{"id": reserve}]
+        stat_items[0] = {"id": scorer, "goals": 2, "assists": 1, "yellowCards": 1}
+        store.settle_match_end({
+            "endReason": "WIN", "items": stat_items, "matchData": "beta2261-card-stats",
+        })
+        index = beta_identity_module.PLAYER_CARD_STAT_INDEX
+        after_one = card_stats(scorer)
+        expected = [0] * 5
+        expected[index["goals"]] = 2
+        expected[index["assists"]] = 1
+        expected[index["yellowCards"]] = 1
+        expected[index["gamesPlayed"]] = 1
+        require(after_one == expected, f"card stats did not accumulate: {after_one} != {expected}")
+        require(card_stats(reserve) == [0] * 5,
+                f"a card that did not start must not be credited an appearance: {card_stats(reserve)}")
+        # A retry of the same match must not double-count.
+        store.settle_match_end({
+            "endReason": "WIN", "items": stat_items, "matchData": "beta2261-card-stats",
+        })
+        require(card_stats(scorer) == expected, f"a settle retry double-counted card stats: {card_stats(scorer)}")
+        # The probe is a read-path switch; it must never reach the store.
+        import os as _os
+        import probe as _probe
+        _os.environ["FIFA14_PLAYER_STAT_PROBE"] = "1"
+        try:
+            wire = json.loads(_probe.build_fut_json_payload(store.active_squad_document()).decode("utf-8"))
+        finally:
+            _os.environ.pop("FIFA14_PLAYER_STAT_PROBE", None)
+        probed = [int(e["value"]) for e in wire["players"][0]["itemData"]["statsList"]]
+        require(probed == [11, 22, 33, 44, 55], f"the stat probe did not stamp its sentinels: {probed}")
+        require(card_stats(scorer) == expected,
+                f"the stat probe overwrote stored career totals: {card_stats(scorer)}")
+
     # Exact protocol regression from the user's capture: component 28 command 2
     # must be typed success, followed by ResultNotification command 114.
     rpc = build_shared_blaze_bootstrap_response(GAME_REPORTING_COMPONENT, 2, b"")
