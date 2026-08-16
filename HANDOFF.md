@@ -96,8 +96,14 @@ the response must carry the new id because the frontend navigates by it). Rename
 from a player-less PUT, and from a name carried on a sparse write. An empty `squadName`
 means unchanged. A new squad does not become active unless it is the first.
 
-**Seasons.** Eleven divisions, 11 (entry) to 1, ten fixtures each, its own club pool per
-division. Progress is the client's own save round-tripped through
+**Seasons.** The retail ladder: Division 10 (entry) up to Division 1, ten fixtures each,
+its own club pool per division, opposition hardening as it climbs. **Division 11 is not a
+division** -- it is the value the client sends when it has not been placed yet, and
+reporting it back as the club's own division crashed the client (0.4.2) and produced
+"seasons are currently unavailable" (0.4.3). Two rules hold season/user together: report a
+division in 10..1, and do not let seasonId resolve against the record the client holds
+until its own save exists to back it. A fresh club sends `{"seasonId": 2, "divisionId":
+10, "round": 1}`, byte for byte the one document ever seen to work. Progress is the client's own save round-tripped through
 `beta_season_progress`; the server tallies points and settles promotion, relegation and
 the prize itself. See BUG-008 below — written and verifier-covered, not yet confirmed in
 game.
