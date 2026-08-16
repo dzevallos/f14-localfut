@@ -201,10 +201,21 @@ OFFLINE_TOURNAMENTS = [
 # Everything above is the built-in tuning. A user settings file may override the
 # payouts and prizes (tools/fut_settings.py writes it); values are validated and
 # bounded by the loader, and anything it does not mention keeps the value above.
+# "flat" pays MATCH_RESULT_FLAT_COINS by result. "dynamic" restores the retail
+# style payout that the flat rule replaced: a minutes-scaled completion award
+# plus the stat breakdown, so the scoreline and performance matter again. The
+# breakdown was never removed, only overridden, so this is a switch rather than
+# a reimplementation (dzevallos/f14-localfut#4).
+MATCH_REWARD_MODE = "flat"
+
+
 def _apply_local_settings() -> None:
     """Overlay the user settings file onto the built-in tuning above."""
-    global OFFLINE_TOURNAMENT_ROUND_COINS, _R
+    global OFFLINE_TOURNAMENT_ROUND_COINS, _R, MATCH_REWARD_MODE
     settings = load_local_settings()
+    MATCH_REWARD_MODE = str(settings.get("matchRewardMode") or MATCH_REWARD_MODE).strip().lower()
+    if MATCH_REWARD_MODE not in {"flat", "dynamic"}:
+        MATCH_REWARD_MODE = "flat"
     for key, value in (settings.get("matchRewards") or {}).items():
         MATCH_RESULT_FLAT_COINS[key] = int(value)
     # Advertised round coins follow the WIN payout, so re-derive after an override.
@@ -1946,7 +1957,13 @@ class BetaIdentityStore(LocalIdentityStore):
         # screen and diagnostics, but it no longer decides the payout and the
         # DNF modifier cannot reduce it. An abandoned match still pays zero.
         flat_result = ""
-        if completed and not dnf:
+        if MATCH_REWARD_MODE == "dynamic":
+            # Retail-style payout: the completion award scales with minutes and
+            # the skill award is the stat breakdown above, so a 5-0 win pays more
+            # than a 1-0. `completion`, `skill` and `total` already hold exactly
+            # that, so the flat override below is simply skipped.
+            flat_result = "DYNAMIC"
+        elif completed and not dnf:
             flat_result = "WIN" if goals > goals_against else "LOSS" if goals < goals_against else "DRAW"
             completion = int(MATCH_RESULT_FLAT_COINS.get(flat_result, 0))
             skill = 0

@@ -103,6 +103,14 @@ def _load_settings_uncached(path: Path) -> dict[str, Any]:
         if cleaned:
             settings["matchRewards"] = cleaned
 
+    mode = raw.get("matchRewardMode")
+    if isinstance(mode, str):
+        cleaned_mode = mode.strip().lower()
+        if cleaned_mode in {"flat", "dynamic"}:
+            settings["matchRewardMode"] = cleaned_mode
+        else:
+            _diagnostic(f"matchRewardMode must be 'flat' or 'dynamic', not {mode!r}; keeping flat")
+
     prizes = raw.get("tournamentPrizes")
     if isinstance(prizes, dict):
         cleaned_prizes: dict[int, dict[str, int]] = {}

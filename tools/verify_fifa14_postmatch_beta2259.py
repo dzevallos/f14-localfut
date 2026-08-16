@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "server"))
 sys.path.insert(0, str(ROOT))
 
+import beta_identity as beta_identity_module  # noqa: E402
 from beta_identity import (  # noqa: E402
     BetaIdentityStore,
     MATCH_RESULT_FLAT_COINS,
@@ -108,13 +109,20 @@ def main() -> int:
                 f"Gold Cup difficulty was not restored: {response}")
         # A completed result pays a flat, result-based amount, published entirely
         # as the completion component with no stat-derived skill component.
-        expected_win = int(MATCH_RESULT_FLAT_COINS["WIN"])
-        require(int(response.get("completionAward", 0)) == expected_win,
-                f"completion award is not the configured flat WIN payout: {response}")
-        require(int(response.get("skillAward", -1)) == 0,
-                f"flat payout must not publish a stat-derived skill award: {response}")
-        require(int(response.get("totalCoins", 0)) == expected_win,
-                f"total coins is not the configured flat WIN payout: {response}")
+        # Payout mode is a user setting and this suite gates startup, so assert
+        # the mode that is actually configured rather than always the flat one.
+        if beta_identity_module.MATCH_REWARD_MODE == "dynamic":
+            expected_win = int(response.get("totalCoins", 0))
+            require(expected_win > 0 and int(response.get("skillAward", 0)) != 0,
+                    f"dynamic rewards must pay a stat-derived amount: {response}")
+        else:
+            expected_win = int(MATCH_RESULT_FLAT_COINS["WIN"])
+            require(int(response.get("completionAward", 0)) == expected_win,
+                    f"completion award is not the configured flat WIN payout: {response}")
+            require(int(response.get("skillAward", -1)) == 0,
+                    f"flat payout must not publish a stat-derived skill award: {response}")
+            require(int(response.get("totalCoins", 0)) == expected_win,
+                    f"total coins is not the configured flat WIN payout: {response}")
         require(int(response.get("rewardCoins", 0)) == after - before, "DestroyMatch reward does not match wallet delta")
         require(int(response.get("credits", -1)) == after, "DestroyMatch credits are stale")
         require(int(response.get("tournamentId", 0)) == 4, f"tournament identity missing: {response}")
