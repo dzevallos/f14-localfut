@@ -265,8 +265,20 @@ PLAYER_CARD_STAT_PROBE_VALUES = (11, 22, 33, 44, 55)
 
 
 def player_card_stat_probe() -> bool:
-    """Serve index-revealing sentinels instead of real per-card stats."""
-    return str(os.environ.get("FIFA14_PLAYER_STAT_PROBE", "")).strip().lower() in {"1", "true", "yes", "on"}
+    """Serve index-revealing sentinels instead of real per-card stats.
+
+    Settable two ways because one of them does not reach a normal launch: the
+    launcher relaunches itself elevated, and that drops environment variables set
+    in the user's shell. `diagnostics.playerStatProbe` in the settings file beside
+    the save survives it; the env var stays for a terminal run and wins when set.
+    """
+    raw = str(os.environ.get("FIFA14_PLAYER_STAT_PROBE", "")).strip().lower()
+    if raw:
+        return raw in {"1", "true", "yes", "on"}
+    try:
+        return bool((load_local_settings().get("diagnostics") or {}).get("playerStatProbe"))
+    except Exception:
+        return False
 
 
 def apply_player_card_stat_probe(document: Any) -> Any:

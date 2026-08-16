@@ -3207,7 +3207,14 @@ class BetaIdentityStore(LocalIdentityStore):
         `FIFA14_SEASON_SAVE_MODE=round` drops back to the three members the
         2026-08-16 capture proves parse cleanly, without losing the save.
         """
-        raw = os.environ.get("FIFA14_SEASON_SAVE_MODE", "blob").strip().lower()
+        raw = os.environ.get("FIFA14_SEASON_SAVE_MODE", "").strip().lower()
+        if not raw:
+            # The launcher elevates itself, which drops shell environment
+            # variables, so the settings file has to be able to say this too.
+            try:
+                raw = str((load_local_settings().get("diagnostics") or {}).get("seasonSaveMode") or "").lower()
+            except Exception:
+                raw = ""
         return "round" if raw in {"round", "minimal", "off"} else "blob"
 
     def _season_user_document_locked(
