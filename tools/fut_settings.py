@@ -176,8 +176,38 @@ def show(defaults: dict, saved: dict) -> None:
     print("  Settings changes take effect the next time the server starts.")
 
 
+def edit_reward_mode(defaults: dict, saved: dict) -> dict:
+    current = _effective(defaults, saved).get("matchRewardMode", "flat")
+    print(f"\n  How a completed match pays. Currently: {current}")
+    print()
+    print("    flat     the fixed win / draw / loss amounts, decided only by the result")
+    print("    dynamic  the original FIFA payout: an award that scales with minutes")
+    print("             played, plus a bonus from goals, shots, tackles, corners,")
+    print("             passing, possession and clean sheets, minus fouls and cards")
+    print()
+    print("  Roughly, with the amounts set to 15,000 / 1,000 / 750:")
+    print("    a 1-0 win pays 15,000 flat, or about 630 dynamic")
+    print("    a 5-0 win pays 15,000 flat, or about 830 dynamic")
+    print()
+    print("  Dynamic ignores the win/draw/loss amounts. Cup round coins follow WIN either way.")
+    answer = input(f"  mode (flat/dynamic) [{current}]: ").strip().lower()
+    if not answer:
+        print("  unchanged.")
+        return saved
+    if answer not in {"flat", "dynamic"}:
+        print("  not a mode; leaving it unchanged.")
+        return saved
+    saved["matchRewardMode"] = answer
+    print(f"  payout mode set to {answer}.")
+    return saved
+
+
 def edit_match_rewards(defaults: dict, saved: dict) -> dict:
-    effective = _effective(defaults, saved)["matchRewards"]
+    effective_all = _effective(defaults, saved)
+    effective = effective_all["matchRewards"]
+    if effective_all.get("matchRewardMode") == "dynamic":
+        print("\n  Note: the payout mode is dynamic, so these amounts are not used.")
+        print("  Change the mode from the menu to make them apply again.")
     print("\n  Coins paid for a completed match. Blank keeps the current value.")
     print("  DNF is what an abandoned/quit match pays; it is 0 by default.")
     changes = dict(saved.get("matchRewards") or {})
@@ -299,13 +329,14 @@ MENU = """
   FIFA 14 Local FUT - settings
 ========================================================
   1  Show current settings
-  2  Match rewards        (win / draw / loss / dnf)
-  3  Tournament payouts   (first clear / repeat)
-  4  Transfer market      (rotation, consumable price)
-  5  Set coin balance                        [save]
-  6  Set FIFA Point balance                  [save]
-  7  Clear club, keep the starter squad      [save]
-  8  Reset all settings to defaults
+  2  Match reward mode    (flat / dynamic)
+  3  Match rewards        (win / draw / loss / dnf)
+  4  Tournament payouts   (first clear / repeat)
+  5  Transfer market      (rotation, consumable price)
+  6  Set coin balance                        [save]
+  7  Set FIFA Point balance                  [save]
+  8  Clear club, keep the starter squad      [save]
+  9  Reset all settings to defaults
   0  Exit
 """
 
@@ -326,21 +357,24 @@ def main() -> int:
         if choice == "1":
             show(defaults, saved)
         elif choice == "2":
-            saved = edit_match_rewards(defaults, saved)
+            saved = edit_reward_mode(defaults, saved)
             dirty = True
         elif choice == "3":
-            saved = edit_tournament_prizes(defaults, saved)
+            saved = edit_match_rewards(defaults, saved)
             dirty = True
         elif choice == "4":
-            saved = edit_market(defaults, saved)
+            saved = edit_tournament_prizes(defaults, saved)
             dirty = True
         elif choice == "5":
-            _set_balance("COINS")
+            saved = edit_market(defaults, saved)
+            dirty = True
         elif choice == "6":
-            _set_balance("POINTS")
+            _set_balance("COINS")
         elif choice == "7":
-            clear_club()
+            _set_balance("POINTS")
         elif choice == "8":
+            clear_club()
+        elif choice == "9":
             saved = reset_settings()
             dirty = False
         else:
