@@ -215,8 +215,13 @@ OFFLINE_SEASONS = [
 # returned (divisions 10..1), finding nothing for the division it wanted, and
 # reporting "seasons are currently unavailable". Nothing in our /user document
 # carries an offline division, so the client falls back to its own default of 11.
+# Retail FUT 14's ladder: Division 10 is where a club starts and Division 1 is
+# the top, with the opposition getting harder the further up it climbs. There is
+# no division 11 -- the client asks the season list about 11 when it has not been
+# placed in a division yet, which BETA 2.26 mistook for a division and added a
+# tier for. Serving that number back as the club's own division is what crashed
+# the client on 0.4.2 and produced "seasons are currently unavailable" on 0.4.3.
 OFFLINE_SEASON_DIVISIONS = [
-    (11, "World Tour", 10, 8, 1500),
     (10, "World Tour", 10, 9, 1900),
     (9, "World Tour", 10, 11, 2100),
     (8, "World Tour", 10, 13, 2900),
@@ -234,7 +239,7 @@ OFFLINE_SEASON_DIVISIONS = [
 # retail frontend and pinned by verify_fifa14_beta2), so the bottom two rungs are
 # a safety net you cannot fall out of. From Division 9 up the drop is real.
 SEASON_RELEGATION_THRESHOLDS = {
-    11: 0, 10: 0, 9: 4, 8: 5, 7: 6, 6: 7, 5: 8, 4: 9, 3: 10, 2: 11, 1: 12,
+    10: 0, 9: 4, 8: 5, 7: 6, 6: 7, 5: 8, 4: 9, 3: 10, 2: 11, 1: 12,
 }
 # How long after the Seasons screen saves its state a new match still counts as
 # a season fixture. The captured gap is under a second (save, then kick off), so
@@ -394,14 +399,13 @@ TOURNAMENT_TEAM_POOLS = {
 # 419 clubs qualify, spanning 53.6 to 84.1. The ladder walks that range in even
 # strength steps from ~60 (the starter squad's own level) to the actual top ten.
 SEASON_TEAM_POOLS = {
-    11: (1934, 111705, 111822, 1936, 110747, 898, 1754, 111399, 2056, 111393),  # mean 60.0
-    10: (111091, 1797, 550, 300, 100805, 1925, 919, 112390, 874, 112224),       # mean 62.2
-    9: (254, 1473, 1474, 711, 89, 1832, 269, 571, 691, 64),                     # mean 64.4
-    8: (982, 1926, 1902, 62, 112218, 110, 88, 110062, 1807, 1796),              # mean 66.6
-    7: (110930, 110456, 1878, 111974, 453, 1838, 14, 226, 674, 110636),         # mean 68.8
-    6: (1952, 217, 206, 1837, 1799, 78, 1843, 246, 569, 1917),                  # mean 71.0
-    5: (189, 452, 10029, 1629, 54, 38, 1896, 15, 65, 247),                      # mean 73.2
-    4: (69, 23, 1035, 1806, 100767, 481, 315, 448, 219, 1960),                  # mean 75.4
+    10: (1934, 111705, 111822, 1936, 110747, 898, 1754, 111399, 2056, 111393),  # mean 60.0
+    9: (1925, 919, 112390, 874, 112224, 111092, 77, 1476, 1794, 272),           # mean 62.5
+    8: (239, 110913, 1904, 1919, 112387, 694, 209, 110231, 112134, 294),        # mean 64.9
+    7: (15005, 200, 1831, 689, 162, 1882, 111271, 165, 3, 110329),              # mean 67.3
+    6: (71, 1909, 110500, 29, 58, 673, 1906, 1793, 244, 1861),                  # mean 69.9
+    5: (468, 110227, 171, 483, 450, 166, 480, 517, 169, 1860),                  # mean 72.3
+    4: (110364, 109, 573, 1819, 101059, 28, 50, 280, 106, 1824),                # mean 74.6
     3: (144, 175, 457, 13, 34, 100769, 7, 325, 48, 236),                        # mean 77.1
     2: (52, 461, 234, 110374, 46, 47, 44, 9, 240, 1),                           # mean 78.7
     # Messi (241), Ronaldo (243), Ribery (21), Aguero (10), Mata (5).
@@ -423,10 +427,10 @@ def _season_difficulty(division: int, index: int) -> int:
 
     Same enum as the cup ladder (0 Beginner .. 5 Legendary) and the same caveat:
     whether the client feeds it to the AI or only to the label is still
-    unconfirmed. Division 11 opens on Amateur and Division 1 sits on Legendary,
+    unconfirmed. Division 10 opens on Amateur and Division 1 sits on Legendary,
     with the closing three fixtures of every season a step harder.
     """
-    base = 1 + (11 - int(division)) * 4 // 10
+    base = 1 + (10 - int(division)) * 4 // 9
     return int(max(1, min(5, base + (1 if int(index) >= 7 else 0))))
 
 
@@ -443,7 +447,7 @@ def _season_matches(division: int, match_count: int) -> list[dict[str, Any]]:
             "difficulty": _season_difficulty(division, index),
             "rewardMult": 1,
             "roundId": int(index),
-            "coins": int(250 + (11 - int(division)) * 25 + index * 10),
+            "coins": int(250 + (10 - int(division)) * 25 + index * 10),
         })
     return rows
 
@@ -3255,15 +3259,25 @@ class BetaIdentityStore(LocalIdentityStore):
             "divisionId": division,
             "round": max(1, min(int(matches), int(row["round_value"] or 1))),
         }
-        # seasonId always names the ladder record for the division reported
-        # above, so the two members are self-consistent. The one run that ever
-        # opened this screen sent exactly that -- seasonId 2 with divisionId 10 --
-        # and it did not matter that the list being served at the time held a
-        # different division. What broke the two 0.4 attempts was the *division*,
-        # not the id; see _first_real_division.
+        # Two independent things have to be right here, and each was learned the
+        # hard way:
+        #
+        #   divisionId must be one the client recognises (10..1). Reporting its
+        #   own "unplaced" 11 back crashed the client on 0.4.2 and produced
+        #   "unavailable" on 0.4.3.
+        #
+        #   seasonId must not resolve to a served record until the client's own
+        #   save exists to go with it. Resolving sends it into the resume path,
+        #   which dereferences that save.
+        #
+        # A fresh club therefore sends seasonId 2 / divisionId 10 / round 1 --
+        # byte for byte the one document ever observed to open this screen, draw
+        # its fixtures and play a match.
         #
         # Each buffer is followed by its own version, which is the member order
         # the cup resume response had to be reshaped into to stop crashing.
+        if not str(row["season_data"] or "") or self.season_save_mode() != "blob":
+            document["seasonId"] = _season_ladder_id(division) + 1
         if str(row["season_data"] or "") and self.season_save_mode() == "blob":
             document["data"] = str(row["season_data"])
             document["dataVersion"] = max(1, int(row["data_version"] or 1))
@@ -3309,11 +3323,17 @@ class BetaIdentityStore(LocalIdentityStore):
             return {"seasons": seasons}
         filtered = [row for row in seasons if int(row.get("divisionId", 0)) in wanted]
         if not filtered:
+            # 11 is the client's "not placed in a division yet" value, so this is
+            # the normal question from a club with no season history: offer it the
+            # entry division. Returning the whole ladder instead is what produced
+            # "seasons are currently unavailable" before BETA 2.26.
+            entry = [row for row in seasons if int(row["divisionId"]) == _entry_season_division()]
             _diagnostic(
-                f"season list asked for division(s) {sorted(wanted)} which the ladder does not "
-                f"contain (it has {[row['divisionId'] for row in seasons]}); returning all"
+                f"season list asked for division(s) {sorted(wanted)}, which the ladder "
+                f"({[row['divisionId'] for row in seasons]}) does not contain; "
+                f"offering division {_entry_season_division()}"
             )
-            return {"seasons": seasons}
+            return {"seasons": entry or seasons}
         current = self.current_season_division()
         if current not in wanted:
             _diagnostic(

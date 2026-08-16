@@ -281,6 +281,8 @@ def main() -> int:
             fail(f"season divisions must descend without repeats: {ladder}")
         if ladder != list(range(ladder[0], ladder[0] - len(ladder), -1)):
             fail(f"season divisions must be contiguous so promotion has somewhere to go: {ladder}")
+        if ladder != list(range(10, 0, -1)):
+            fail(f"the retail ladder is Division 10 down to 1: {ladder}")
         if ladder[0] != store.entry_season_division():
             fail(f"the ladder must start at the entry division {store.entry_season_division()}: {ladder}")
         if [int(row["id"]) for row in season_rows] != list(range(1, len(season_rows) + 1)):
@@ -351,17 +353,27 @@ def main() -> int:
         # seasonId 2 / divisionId 10 / round 1, and seasonId names the ladder
         # record for that division, so the two stay self-consistent.
         served_ids = {int(row["id"]) for row in season_rows}
-        if int(season_user["divisionId"]) > 10:
+        if not 1 <= int(season_user["divisionId"]) <= 10:
             fail(f"season/user must report a division the client recognises (10..1): {season_user}")
+        # Against the list the client actually holds -- it asks about one division
+        # at a time, so this is the single entry record, not the whole ladder.
+        held_ids = {int(r["id"]) for r in store.offline_seasons_list({"divisionList": ["11"]})["seasons"]}
+        if int(season_user["seasonId"]) in held_ids:
+            fail(f"a season with no saved state must not claim a seasonId the client holds: {season_user}")
         if season_user != {"seasonId": 2, "divisionId": 10, "round": 1}:
             fail(f"fresh season/user drifted off the one document proven to work: {season_user}")
         # The screen names the divisions it wants; serve those.
         asked = store.offline_seasons_list({"divisionList": [str(store.entry_season_division())]})
         if [int(r["divisionId"]) for r in asked["seasons"]] != [store.entry_season_division()]:
             fail(f"a divisionList filter must be honoured: {[r['divisionId'] for r in asked['seasons']]}")
-        unknown = store.offline_seasons_list({"divisionList": ["99"]})
-        if len(unknown["seasons"]) != len(season_rows):
-            fail("an unknown division must fall back to the whole ladder, not an empty list")
+        # 11 is the client's "not placed yet" value, and a division we do not
+        # have must offer the entry season rather than the whole ladder -- dumping
+        # every record is what produced "seasons are currently unavailable".
+        for unplaced in ("11", "99"):
+            offered = store.offline_seasons_list({"divisionList": [unplaced]})["seasons"]
+            if [int(r["divisionId"]) for r in offered] != [store.entry_season_division()]:
+                fail(f"divisionList={unplaced} must offer only the entry division: "
+                     f"{[r['divisionId'] for r in offered]}")
 
         # BETA 2.26.1 -- offline seasons persist and the ladder has real tiers.
         #

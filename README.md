@@ -20,7 +20,7 @@ Each one names the diagnostic that would settle it.
 | Cup opponents and difficulty | **Reworked** — tiered per cup |
 | Transfer market | **Reworked** — rotating stock, consumables always in stock, ordered by time remaining |
 | Match / cup payouts | **Configurable**, no code editing |
-| Offline Seasons | **Reworked** — eleven tiered divisions, progress saves, promotion and relegation. Opens and plays; the ladder needs one full season to confirm |
+| Offline Seasons | **Reworked** — the retail ladder, Division 10 up to Division 1, with opponents getting harder as you climb. Progress saves; promotion and relegation are settled server-side |
 | Player card stats | **Fixed** — goals, assists, cards and appearances accumulate per card |
 | Frame rate during a match | **Fixed** — a diagnostic hook was rebuilding a full stack trace for every debug line the game printed |
 | Club venue | **Configurable** — defaults to Forest Park |
@@ -136,8 +136,8 @@ it is what identified the cup crash above, in the client's own words.
 server settles promotion and relegation itself. What is unconfirmed is who owns the
 division number: the client has its own `GetUsersOfflineDivision` and asks the season
 list for a specific division, and whether it adopts the one `season/user` reports has
-never been observed. Play a division-11 season to the end and check whether the next
-`season/list` request asks for division 10. `fut-season-request-beta2260` logs the
+never been observed. Play a Division 10 season to the end and check whether the next
+`season/list` request asks for Division 9. `fut-season-request-beta2260` logs the
 divisions served next to the club's actual division on every request.
 
 **Which stat is in which slot on a player card?** Goals and appearances now accumulate,
