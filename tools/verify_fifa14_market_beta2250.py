@@ -191,23 +191,43 @@ def main() -> int:
             require(li._market_card_in_rotation(resource, rotation) ==
                     li._market_card_in_rotation(resource, rotation),
                     f"rotation membership is not deterministic for {resource}")
-        market_now = store.market_search({"start": ["0"], "num": ["10"]})
         # A card bought earlier in this run is withheld for
-        # MARKET_SYNTHETIC_RELIST_SECONDS, so the rotation's listing count is the
-        # ceiling and recent sales come off it. Comparing the two raw numbers only
-        # held while the Buy Now above happened to take a card the rotation was
-        # not listing anyway -- which stopped being true the moment listings were
-        # ordered by expiry and page one changed (#13).
+        # MARKET_SYNTHETIC_RELIST_SECONDS, so the rotation's listing count is a
+        # ceiling and a recent sale comes off it -- but only if that card is in
+        # the rotation being counted. Rotations turn over every 30 minutes and
+        # this suite does a lot between the Buy Now and here, so the sold card is
+        # routinely in a rotation that has since ended, and then nothing is
+        # withheld at all. Decode each recent sale and ask.
+        #
+        # The clock is pinned across the whole check for the same reason: search,
+        # count and membership have to be answered for one rotation, or a
+        # boundary crossed mid-check fails a verifier that gates startup.
         clock = int(__import__("time").time())
-        with store._lock, closing(store._connect()) as probe_connection:
-            withheld = int(probe_connection.execute(
-                "SELECT COUNT(*) FROM market_synthetic_sales WHERE sold_at>=?",
-                (clock - li.MARKET_SYNTHETIC_RELIST_SECONDS,),
-            ).fetchone()[0])
-        expected_total = store._market_rotation_listing_count(clock) - withheld
-        require(int(market_now["total"]) == expected_total,
-                f"search total {market_now['total']} is not the rotation's "
-                f"{store._market_rotation_listing_count(clock)} less {withheld} recent sale(s)")
+        rotation_now = li._market_rotation_index(clock)
+        real_clock = li.time.time
+        try:
+            li.time.time = lambda: clock
+            market_now = store.market_search({"start": ["0"], "num": ["10"]})
+            rotation_count = store._market_rotation_listing_count(clock)
+            with store._lock, closing(store._connect()) as probe_connection:
+                sold_rows = probe_connection.execute(
+                    "SELECT trade_id FROM market_synthetic_sales WHERE sold_at>=?",
+                    (clock - li.MARKET_SYNTHETIC_RELIST_SECONDS,),
+                ).fetchall()
+        finally:
+            li.time.time = real_clock
+        withheld = 0
+        for sold in sold_rows:
+            decoded = store._market_from_trade_id(int(sold[0]))
+            if decoded is None:
+                continue
+            sold_player, _copy = decoded
+            sold_resource = int(sold_player.get("resourceId", sold_player.get("assetId", 0)) or 0)
+            if li._market_card_in_rotation(sold_resource, rotation_now):
+                withheld += 1
+        require(int(market_now["total"]) == rotation_count - withheld,
+                f"search total {market_now['total']} is not the rotation's {rotation_count} "
+                f"less the {withheld} recent sale(s) it is still withholding")
 
         # Listings are shuffled per rotation rather than sorted by rating, which
         # otherwise opens every page with the best cards in the game, three
