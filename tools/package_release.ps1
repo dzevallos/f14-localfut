@@ -76,20 +76,6 @@ try {
         Remove-Item -LiteralPath $Packager -Force
     }
 
-    # The filter above only sees top-level entries, and directories are copied
-    # whole -- so compiled caches nested inside server\ and tools\ came along.
-    # A .pyc embeds the absolute path it was compiled from, which means the
-    # builder's Windows user name shipped to everyone who downloaded the ZIP.
-    # Use -Filter, not -Include: with a -LiteralPath that has no wildcard,
-    # -Include is silently ignored and the pipeline yields *every* file.
-    Get-ChildItem -LiteralPath $StageRoot -Recurse -Force -Directory -Filter "__pycache__" |
-        Sort-Object -Property FullName -Descending |
-        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force }
-    foreach ($compiled in @("*.pyc", "*.pyo")) {
-        Get-ChildItem -LiteralPath $StageRoot -Recurse -Force -File -Filter $compiled |
-            ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force }
-    }
-
     # Verify the package, not the working folder. A release is a *different tree*
     # from the repo -- no .gitignore, no .git, no artifacts -- and 0.2-beta
     # shipped unable to start because a verifier read a file the packager strips
@@ -111,16 +97,33 @@ try {
         $previousPreference = $ErrorActionPreference
         $ErrorActionPreference = "Continue"
         try {
+            $env:PYTHONDONTWRITEBYTECODE = "1"
             & $PythonExe $verifierPath *> $null
             $verifierExit = $LASTEXITCODE
         } finally {
             $ErrorActionPreference = $previousPreference
+            Remove-Item Env:\PYTHONDONTWRITEBYTECODE -ErrorAction SilentlyContinue
         }
         if ($verifierExit -ne 0) {
             throw ("Refusing to package: $verifier fails inside the release tree, " +
                    "so the launcher would refuse to start for anyone who downloads it. " +
                    "Re-run it directly to see why: python tools\$verifier")
         }
+    }
+
+    # Prune last. Anything that runs Python against the stage recreates these,
+    # and the pre-flight verification above does exactly that -- pruning earlier
+    # let the caches back into 0.3 after they had already been fixed once.
+    # A .pyc embeds the absolute path it was compiled from, so this is the
+    # builder's user name shipping to every downloader.
+    # Use -Filter, not -Include: with a -LiteralPath that has no wildcard,
+    # -Include is silently ignored and the pipeline yields *every* file.
+    Get-ChildItem -LiteralPath $StageRoot -Recurse -Force -Directory -Filter "__pycache__" |
+        Sort-Object -Property FullName -Descending |
+        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force }
+    foreach ($compiled in @("*.pyc", "*.pyo")) {
+        Get-ChildItem -LiteralPath $StageRoot -Recurse -Force -File -Filter $compiled |
+            ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force }
     }
 
     if (Test-Path -LiteralPath $ZipPath) {
