@@ -203,13 +203,23 @@ def main() -> int:
         store.create_match({"squadId": 1, "type": "OFFLINE"})
         store.match_ready({"items": [{"id": item_id} for item_id in eleven]})
         stat_items = [{"id": item_id} for item_id in eleven] + [{"id": reserve}]
-        stat_items[0] = {"id": scorer, "goals": 2, "assists": 1, "yellowCards": 1}
+        stat_items[0] = {"id": scorer, "goals": 2, "assists": 1, "yellowCards": 1, "redCards": 1}
         settled = store.settle_match_end({
             "endReason": "WIN", "items": stat_items, "matchData": "beta2261-card-stats",
         })
-        require(all(row.get("redCards") == 0 and row.get("suspension") == 0
-                    for row in settled.get("items", [])),
+        # Rows the client said nothing about must carry explicit zeroes, or stale
+        # red-card state can survive the result refresh. A player the client *did*
+        # send off still echoes its own red card back -- that is the match's own
+        # stat, and suppressing it would misreport the game to itself.
+        submitted_reds = {int(row["id"]) for row in stat_items if int(row.get("redCards", 0) or 0)}
+        require(all(row.get("suspension") == 0 for row in settled.get("items", [])),
+                f"completed match must clear suspension state: {settled.get('items')}")
+        require(all(row.get("redCards") == 0
+                    for row in settled.get("items", []) if int(row["id"]) not in submitted_reds),
                 f"completed match must explicitly clear absent red-card state: {settled.get('items')}")
+        require(all(int(row.get("redCards", 0)) == 1
+                    for row in settled.get("items", []) if int(row["id"]) in submitted_reds),
+                f"a reported red card must be echoed back, not swallowed: {settled.get('items')}")
         index = beta_identity_module.PLAYER_CARD_STAT_INDEX
         after_one = card_stats(scorer)
         expected = [0] * 5
@@ -217,6 +227,10 @@ def main() -> int:
         expected[index["assists"]] = 1
         expected[index["yellowCards"]] = 1
         expected[index["gamesPlayed"]] = 1
+        # Slot 2 stays zero even though the client reported a red card: it is what
+        # the client reads to bench a player, not a career total. Accumulating it
+        # would suspend the card for good.
+        expected[index["redCards"]] = 0
         require(after_one == expected, f"card stats did not accumulate: {after_one} != {expected}")
         require(card_stats(reserve) == [0] * 5,
                 f"a card that did not start must not be credited an appearance: {card_stats(reserve)}")

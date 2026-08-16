@@ -2582,11 +2582,17 @@ class BetaIdentityStore(LocalIdentityStore):
             # ever written. Games played is counted for the eleven that actually
             # started, which is the same set the contract decrement uses.
             if decrement_contracts:
+                # Red cards are deliberately NOT accumulated. Slot 2 is the one
+                # the client reads to decide a player is suspended and unavailable
+                # for selection -- it is current availability, not a career total.
+                # Writing a lifetime count there benches the card permanently, and
+                # it is the same slot that made an entire squad look red-carded
+                # when the stat probe stamped a sentinel into it. Suspension is
+                # the client's own `suspension` member and stays its business.
                 bumps = {
                     "goals": match_goals,
                     "assists": match_assists,
                     "yellowCards": _submitted_stat("yellowCards"),
-                    "redCards": _submitted_stat("redCards"),
                     "gamesPlayed": 1 if item_id in starters else 0,
                 }
                 self._bump_card_stats(payload, bumps)
@@ -3103,9 +3109,26 @@ class BetaIdentityStore(LocalIdentityStore):
             # PUT /season/<id>/division/11/user; normalize the alias before
             # match or resume code consumes it.
             canonical_division = _first_real_division()
+            # The saved blob has to go with it. It is the client's own record of
+            # a season in the *old* division -- its fixtures, its results, its
+            # players -- and serving it back against a different season is not a
+            # cosmetic mismatch: the 2026-08-16 23:32 capture restored a
+            # division-11-era blob into a division-10 season and the pre-match
+            # squad screen came back with every player showing a red card.
+            # Round and tally reset with it, or the club resumes at a round the
+            # client has no state for.
             connection.execute(
-                "UPDATE beta_season_progress SET season_id=?,division=? WHERE persona_id=?",
-                (int(_season_ladder_id(canonical_division)), int(canonical_division), int(persona_id)),
+                "UPDATE beta_season_progress SET season_id=?,division=?,round_value=1,"
+                "matches_played=0,points=0,won=0,draw=0,lost=0,data_version=1,season_data='',"
+                "progress_data_version=1,progress_data='',saved_at=0,updated_at=? "
+                "WHERE persona_id=?",
+                (int(_season_ladder_id(canonical_division)), int(canonical_division),
+                 int(time.time()), int(persona_id)),
+            )
+            _diagnostic(
+                f"migrated a stored season from division {int(row['division'])} to "
+                f"{canonical_division}; its saved state belonged to the old division and "
+                "was cleared rather than restored"
             )
             row = connection.execute(
                 "SELECT * FROM beta_season_progress WHERE persona_id=?", (int(persona_id),)
@@ -3438,6 +3461,21 @@ class BetaIdentityStore(LocalIdentityStore):
                     f"a new division {current_division} season had already started"
                 )
                 return payload
+            if payload["round"] <= 1 and int(row["matches_played"]) > 0:
+                # The client is back at the first fixture while our tally says the
+                # season is under way, which means it started the season over --
+                # it owns the fixture list, so its count is the real one. Without
+                # this the server would settle promotion against results the
+                # client has already discarded.
+                _diagnostic(
+                    f"client restarted its division {current_division} season at round 1 "
+                    f"after {int(row['matches_played'])} tallied fixture(s); clearing the tally"
+                )
+                connection.execute(
+                    "UPDATE beta_season_progress SET matches_played=0,points=0,won=0,draw=0,"
+                    "lost=0 WHERE persona_id=?",
+                    (persona_id,),
+                )
             now = int(time.time())
             connection.execute(
                 """UPDATE beta_season_progress SET round_value=?,data_version=?,season_data=?,

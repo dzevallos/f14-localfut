@@ -430,9 +430,19 @@ def main() -> int:
         if int(after_reset["round"]) != 1 or int(after_reset["divisionId"]) > 10:
             fail(f"a season reset must return the club to round 1 in a real division: {after_reset}")
         # A previous build persisted the client's unplaced request (11) as the
-        # season division. It must migrate to the real entry tier without losing
-        # the saved round/blob, and a subsequent PUT using 11 must remain an
-        # accepted alias rather than being discarded as stale.
+        # season division. It must migrate to the real entry tier, and the saved
+        # state must NOT come with it.
+        #
+        # This assertion used to require the opposite -- migrate "without losing
+        # progress" -- which reads as the kinder behaviour and is not. The blob
+        # is the client's own record of a season: its fixtures, its results, its
+        # players. Handing a division-11 blob back for a division-10 season is
+        # not a cosmetic mismatch. The 2026-08-16 23:32 capture did exactly that
+        # and the pre-match squad screen came back with every player showing a
+        # red card. There is no way to carry a season across into a different
+        # one; the honest migration starts the new division cleanly.
+        #
+        # A subsequent PUT using 11 must still be an accepted alias.
         with closing(sqlite3.connect(db)) as migration_con, migration_con:
             migration_con.execute(
                 "UPDATE beta_season_progress SET season_id=1,division=11,round_value=2,"
@@ -440,8 +450,10 @@ def main() -> int:
                 "WHERE persona_id=1000001"
             )
         migrated = store.offline_season_user()
-        if migrated.get("divisionId") != 10 or migrated.get("round") != 2 or migrated.get("data") != "MIGRATE":
-            fail(f"persisted unplaced division was not migrated without losing progress: {migrated}")
+        if migrated.get("divisionId") != 10 or migrated.get("round") != 1:
+            fail(f"persisted unplaced division was not migrated to the entry tier: {migrated}")
+        if "data" in migrated:
+            fail(f"a migrated season must not serve the old division's saved state: {migrated}")
         aliased = store.update_offline_season_user(
             1, 11, {"round": 2, "dataVersion": 1, "data": "ALIAS", "progressDataVersion": 1, "progressData": "P"}
         )

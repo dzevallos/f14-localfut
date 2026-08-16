@@ -184,6 +184,19 @@ match-stat rows, not full ItemData. For completed matches, explicitly include
 `redCards: 0` and `suspension: 0` when the client did not submit those fields; omitted
 zeroes can leave stale red-card state in the retail client after the result refresh.
 
+**Saved client state belongs to the season it was written for.** `season_data` is the
+client's own record of a season — its fixtures, its results, its players. It is only valid
+for the exact `(season_id, division)` it was saved under. Any change to that identity —
+a promotion, a reset, a migration, a ladder reshape — must **clear the blob**, not carry it
+across. Serving a division-11-era blob into a division-10 season put every player in the
+pre-match squad screen behind a red card (2026-08-16 23:32 capture). "Migrate without
+losing progress" is the intuitive behaviour and the wrong one: there is no way to carry a
+season into a different season.
+
+**Never write a career total into stat slot 2.** The client reads it as *current
+availability* — any non-zero value marks the player suspended and blocks selection — not as
+a lifetime red-card count. That is also why the stat probe sends 0 in slot 2.
+
 **A fresh club has no active cosmetics** until the retail client selects them. Verifier-
 pinned; do not fabricate one.
 
@@ -254,9 +267,11 @@ reshuffle underneath the client. A per-card continuous timer was tried and rejec
 re-sorted the head of a 5,126-listing market every second. Consumables keep a flat
 `expires: 3600` and one-of-each ordering on purpose.
 
-**Player cards.** Goals, assists, yellows, reds and appearances accumulate into `statsList`
-and `lifetimeStats` (plus their `statsArray` aliases, or the canonicaliser drops whichever
-it was not given). Appearances credit the eleven that started, first settlement only.
+**Player cards.** Goals, assists, yellows and appearances accumulate into `statsList` and
+`lifetimeStats` (plus their `statsArray` aliases, or the canonicaliser drops whichever it
+was not given). Appearances credit the eleven that started, first settlement only. **Red
+cards are deliberately not accumulated** — slot 2 is availability, not history (§5). A red
+card is still echoed back in the match response, which is the match's own stat.
 
 **Club.** `type=equippables` returns kits/stadiums/badges. Venue defaults to **Forest Park,
 stadium id 26 / carddbid 6200010**; configurable through `club.stadiumId` /
