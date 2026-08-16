@@ -3998,7 +3998,12 @@ class HttpProbe(BaseHTTPRequestHandler):
                     response = identity_store.offline_season_user()
                     response_name = "fut-offline-season-user-beta2"
                 else:
-                    response = identity_store.offline_seasons_list()
+                    # The screen names the divisions it wants (divisionList=11).
+                    season_query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                    try:
+                        response = identity_store.offline_seasons_list(season_query)
+                    except TypeError:
+                        response = identity_store.offline_seasons_list()
                     response_name = "fut-offline-seasons-beta2"
             else:
                 response = {"seasons": []}

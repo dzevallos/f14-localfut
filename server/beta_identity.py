@@ -109,14 +109,17 @@ def _resolved_cosmetic_catalog() -> dict[str, list[dict[str, Any]]]:
 OFFLINE_SEASONS = [
     {
         "seasonId": 1,       # season/user is 1-based; native client stores id-1
-        "division": 10,
+        # Must stay the entry division of OFFLINE_SEASON_DIVISIONS below: this
+        # seeds the progress row that season/user reports, and the client asks
+        # the season list for that division by number.
+        "division": 11,
         "name": "World Tour",
         "matchesToPlay": 10,
-        "pointsToWinTitle": 12,
-        "pointsToPromote": 9,
+        "pointsToWinTitle": 11,
+        "pointsToPromote": 8,
         "pointsToAvoidRelegation": 0,
-        "titleRewardCoins": 1900,
-        "promotionRewardCoins": 1500,
+        "titleRewardCoins": 1500,
+        "promotionRewardCoins": 1200,
         "holdingRewardCoins": 300,
         "difficulty": "1 star",
     },
@@ -124,7 +127,14 @@ OFFLINE_SEASONS = [
 
 # division, display-name (server-side only), matches, promotion threshold,
 # championship coin award. Only the parser-native wire members are emitted.
+# Division 11 is the entry division, and it is here because the client asked for
+# it: the 2026-08-15 capture shows the Seasons screen requesting
+# `/season/list?...&divisionList=11&type=offline`, then parsing all ten records we
+# returned (divisions 10..1), finding nothing for the division it wanted, and
+# reporting "seasons are currently unavailable". Nothing in our /user document
+# carries an offline division, so the client falls back to its own default of 11.
 OFFLINE_SEASON_DIVISIONS = [
+    (11, "World Tour", 10, 8, 1500),
     (10, "World Tour", 10, 9, 1900),
     (9, "World Tour", 10, 11, 2100),
     (8, "World Tour", 10, 13, 2900),
@@ -1443,6 +1453,13 @@ class BetaIdentityStore(LocalIdentityStore):
                 ("DELETE FROM market_synthetic_sales", ()),
                 ("DELETE FROM beta_tournament_progress WHERE persona_id=?", (persona_id,)),
                 ("UPDATE beta_offline_tournaments SET current_round=0, won=0 WHERE persona_id=?", (persona_id,)),
+                # The W-D-L record the hub shows is derived from settled match
+                # sessions, so a fresh club has to lose them too -- otherwise it
+                # comes back reading 5-0-5 with no squad that played any of it
+                # (dzevallos/f14-localfut#7).
+                ("DELETE FROM beta_match_sessions WHERE persona_id=?", (persona_id,)),
+                ("UPDATE beta_offline_seasons SET matches_played=0, points=0, won=0, draw=0, "
+                 "lost=0, trophies_won=0 WHERE persona_id=?", (persona_id,)),
                 # Dropping the club row is what makes ensure_beta_starter_club()
                 # take its fresh-profile path below.
                 ("DELETE FROM clubs WHERE persona_id=?", (persona_id,)),
@@ -2629,12 +2646,39 @@ class BetaIdentityStore(LocalIdentityStore):
             }
         return response
 
-    def offline_seasons_list(self) -> dict[str, Any]:
-        """Return the exact CardsDLL offline-season list schema recovered in BETA 2.6."""
+    @staticmethod
+    def entry_season_division() -> int:
+        """The division a club with no season history starts in."""
+        return int(OFFLINE_SEASON_DIVISIONS[0][0])
+
+    def offline_seasons_list(self, query: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Return the exact CardsDLL offline-season list schema recovered in BETA 2.6.
+
+        The screen asks for the divisions it wants (`divisionList=11` in the
+        2026-08-15 capture) and shows "seasons are currently unavailable" if none
+        of the records we return carries one of them. Serve what it asked for
+        rather than assuming which divisions it should have wanted; with no
+        filter, return the whole ladder as before.
+        """
         seasons = [
             _native_season_record(index, division, matches, promote, coins)
             for index, (division, _name, matches, promote, coins) in enumerate(OFFLINE_SEASON_DIVISIONS, start=1)
         ]
+        wanted: set[int] = set()
+        for key in ("divisionList", "divisionlist", "division", "divisionId"):
+            for value in (query or {}).get(key, []) if isinstance(query, dict) else []:
+                for part in str(value).split(","):
+                    part = part.strip()
+                    if part.lstrip("-").isdigit():
+                        wanted.add(int(part))
+        if wanted:
+            filtered = [row for row in seasons if int(row.get("divisionId", 0)) in wanted]
+            if filtered:
+                return {"seasons": filtered}
+            _diagnostic(
+                f"season list asked for division(s) {sorted(wanted)} which the ladder does not "
+                f"contain (it has {[row['divisionId'] for row in seasons]}); returning all"
+            )
         return {"seasons": seasons}
 
     def offline_season_user(self) -> dict[str, Any]:
@@ -2642,20 +2686,39 @@ class BetaIdentityStore(LocalIdentityStore):
 
         The retail season/user parser handles seasonId, divisionId and round.
         `seasonId` is decremented by the client, so ID 1 selects the first
-        season-list record (Division 10). Unknown guessed progression members
-        are intentionally omitted.
+        season-list record. Unknown guessed progression members are omitted.
+
+        The division has to be the entry division rather than a fixed 10, and
+        has to agree with the first record in the list: the client asks the list
+        for that division by number, so the two drifting apart is what leaves
+        the screen with nothing to show.
         """
+        division = self.entry_season_division()
         with self._lock, closing(self._connect()) as connection:
             persona_id = int(self._identity(connection)["persona_id"])
             row = connection.execute(
-                "SELECT * FROM beta_offline_seasons WHERE persona_id=? AND division=10 AND active=1 ORDER BY season_id LIMIT 1",
-                (persona_id,),
+                "SELECT * FROM beta_offline_seasons WHERE persona_id=? AND division=? AND active=1 ORDER BY season_id LIMIT 1",
+                (persona_id, division),
             ).fetchone()
+            if row is None:
+                # A club seeded before division 11 existed still has its old
+                # row; fall back to whatever season it does have.
+                row = connection.execute(
+                    "SELECT * FROM beta_offline_seasons WHERE persona_id=? AND active=1 ORDER BY division DESC LIMIT 1",
+                    (persona_id,),
+                ).fetchone()
+                if row is not None:
+                    division = int(row["division"])
             # CardsDLL decrements the wire `round` value before storing it.
             # Sending 0 therefore becomes 0xFFFF (its invalid/default sentinel).
             # Wire round 1 represents the first scheduled match (internal 0).
             round_index = 0 if row is None else max(0, int(row["matches_played"]))
-        return {"seasonId": 1, "divisionId": 10, "round": round_index + 1}
+        season_id = next(
+            (index for index, entry in enumerate(OFFLINE_SEASON_DIVISIONS, start=1)
+             if int(entry[0]) == division),
+            1,
+        )
+        return {"seasonId": season_id, "divisionId": division, "round": round_index + 1}
 
     def tournament_wire_mode(self) -> str:
         raw = os.environ.get("FIFA14_TOURNAMENT_MODE", "native").strip().lower()
