@@ -343,10 +343,16 @@ def main() -> int:
         # season/user and season/list have to agree on the division, because the
         # client asks the list for the division it believes it is in. Them
         # drifting apart is exactly what left the screen with nothing to show.
-        if season_user != {"seasonId": 1, "divisionId": store.entry_season_division(), "round": 1}:
+        # A club that has never played a season must NOT be given a seasonId that
+        # resolves to a served record. The client walks into its resume path and
+        # reads through a null pointer -- the state it saved for itself, which
+        # does not exist yet (access violation at CardsDLLzf+0xc66dd, captured
+        # 2026-08-16 16:53 entering Seasons on 0.4.2).
+        served_ids = {int(row["id"]) for row in season_rows}
+        if int(season_user["seasonId"]) in served_ids:
+            fail(f"a season with no saved state must not claim a listed seasonId: {season_user}")
+        if int(season_user["divisionId"]) != store.entry_season_division() or int(season_user["round"]) != 1:
             fail(f"fresh offline season progress must point at the entry division, round 1: {season_user}")
-        if int(season_rows[int(season_user["seasonId"]) - 1]["divisionId"]) != int(season_user["divisionId"]):
-            fail(f"season/user seasonId does not select its own division in the list: {season_user}")
         # The screen names the divisions it wants; serve those.
         asked = store.offline_seasons_list({"divisionList": [str(store.entry_season_division())]})
         if [int(r["divisionId"]) for r in asked["seasons"]] != [store.entry_season_division()]:
@@ -389,6 +395,8 @@ def main() -> int:
             fail(f"dataVersion decodes the buffer before it, so data must come first: {list(resumed)}")
         if int(resumed["seasonId"]) != 1 or int(resumed["divisionId"]) != store.entry_season_division():
             fail(f"a saved season must not move the club off its division: {resumed}")
+        if int(resumed["seasonId"]) not in served_ids:
+            fail(f"once the client's own save exists, the seasonId must resolve: {resumed}")
         # A save for a division the club is not in belongs to a finished season.
         stale = store.update_offline_season_user(9, 3, {"round": 7, "dataVersion": 1, "data": "Wlpa"})
         if int(store.offline_season_user()["divisionId"]) != store.entry_season_division():
@@ -402,15 +410,18 @@ def main() -> int:
             os.environ.pop("FIFA14_SEASON_SAVE_MODE", None)
         if set(minimal) != {"seasonId", "divisionId", "round"}:
             fail(f"the round-only fallback must send exactly the three proven members: {minimal}")
+        if int(minimal["seasonId"]) in served_ids:
+            fail(f"the round-only fallback withholds the save, so it must not claim a season: {minimal}")
         if int(minimal["round"]) != 2:
             fail(f"the round-only fallback must keep the saved round: {minimal}")
         if store.offline_season_history() != {"seasons": []}:
             fail("history must be empty until a season finishes, not a copy of the active list")
         store.reset_offline_season(1, store.entry_season_division())
-        if store.offline_season_user() != {
-            "seasonId": 1, "divisionId": store.entry_season_division(), "round": 1
-        }:
-            fail(f"a season reset must return the club to round 1: {store.offline_season_user()}")
+        after_reset = store.offline_season_user()
+        if int(after_reset["round"]) != 1 or int(after_reset["divisionId"]) != store.entry_season_division():
+            fail(f"a season reset must return the club to round 1: {after_reset}")
+        if int(after_reset["seasonId"]) in served_ids:
+            fail(f"a reset clears the save, so the season must stop being current: {after_reset}")
 
         # BETA 2.22 keeps the proven native PC tournament schema but exposes
         # four independent knockout cups. `rounds` remains an ARRAY; names are
