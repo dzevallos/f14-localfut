@@ -139,13 +139,25 @@ list for a specific division, and whether it adopts the one `season/user` report
 never been observed. Play a division-11 season to the end and check whether the next
 `season/list` request asks for division 10. `fut-season-request-beta2260` logs the
 divisions served next to the club's actual division on every request.
-If the screen breaks on a restored save, `FIFA14_SEASON_SAVE_MODE=round` falls back to
-the three members known to parse, without losing the save.
 
 **Which stat is in which slot on a player card?** Goals and appearances now accumulate,
 but each card carries five unlabelled stat slots and the order is inferred, not
-recorded. `FIFA14_PLAYER_STAT_PROBE=1` serves 11/22/33/44/55 in slots 0-4, so one look
-at a card detail screen decodes it. Read-only: your real totals are untouched.
+recorded. Turn the probe on and every card reports 11/22/33/44/55 in those five slots,
+so one look at a card detail screen decodes it. Your stored totals are untouched — the
+probe only changes what is sent to the game.
+
+Both switches live in **`FUT_SETTINGS.cmd` → 9 (Testing switches)**, which writes them
+to the settings file beside your save:
+
+```json
+{ "diagnostics": { "playerStatProbe": true, "seasonSaveMode": "round" } }
+```
+
+They are deliberately not environment variables. The launcher relaunches itself
+elevated, and Windows starts that elevated process with a fresh environment, so
+anything exported in a shell beforehand never reaches the server. (`FIFA14_PLAYER_STAT_PROBE`
+and `FIFA14_SEASON_SAVE_MODE` still work if you start the server directly from a
+terminal, and win over the file.)
 
 **Does round difficulty reach the AI, or is it only a label?** Match length is
 label-only — gameplay reads the client's own settings — so difficulty may be too. The

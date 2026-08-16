@@ -131,6 +131,27 @@ def _load_settings_uncached(path: Path) -> dict[str, Any]:
         if cleaned_prizes:
             settings["tournamentPrizes"] = cleaned_prizes
 
+    # Diagnostics a tester has to be able to turn on without a terminal. These
+    # were env-var-only, which does not work for the way the game is actually
+    # started: RUN_FIFA14_LOCAL_BETA.cmd relaunches itself elevated through
+    # ShellExecute, and that boundary drops any variable set in the user's shell.
+    # The settings file is next to the save and is read after elevation, so it
+    # reaches the server either way. An env var still wins when one is set.
+    diagnostics = raw.get("diagnostics")
+    if isinstance(diagnostics, dict):
+        cleaned_diagnostics: dict[str, Any] = {}
+        if "playerStatProbe" in diagnostics:
+            cleaned_diagnostics["playerStatProbe"] = bool(diagnostics.get("playerStatProbe"))
+        season_save = diagnostics.get("seasonSaveMode")
+        if isinstance(season_save, str):
+            candidate = season_save.strip().lower()
+            if candidate in {"blob", "round"}:
+                cleaned_diagnostics["seasonSaveMode"] = candidate
+            else:
+                _diagnostic(f"diagnostics.seasonSaveMode must be 'blob' or 'round', not {season_save!r}")
+        if cleaned_diagnostics:
+            settings["diagnostics"] = cleaned_diagnostics
+
     club = raw.get("club")
     if isinstance(club, dict):
         cleaned_club: dict[str, Any] = {}

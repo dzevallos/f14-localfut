@@ -261,6 +261,45 @@ def edit_market(defaults: dict, saved: dict) -> dict:
     return saved
 
 
+def edit_diagnostics(defaults: dict, saved: dict) -> dict:
+    """Testing switches. These exist so a tester never needs a terminal.
+
+    They cannot be environment variables in practice: the launcher relaunches
+    itself elevated, and that drops anything set in the user's shell.
+    """
+    changes = dict(saved.get("diagnostics") or {})
+    probe_on = bool(changes.get("playerStatProbe"))
+    print("\n  Testing switches. Blank keeps the current value.")
+    print("  Player card stat probe: every card reports 11/22/33/44/55 in its five")
+    print("  stat slots, so one look at a card says which slot is which. Your real")
+    print("  totals are not touched -- it only changes what is sent to the game.")
+    answer = input(f"  stat probe on? (y/n) [{'y' if probe_on else 'n'}]: ").strip().lower()
+    if answer in {"y", "yes", "on", "1"}:
+        changes["playerStatProbe"] = True
+    elif answer in {"n", "no", "off", "0"}:
+        changes.pop("playerStatProbe", None)
+    elif answer:
+        print("  not a yes/no answer; leaving the probe as it was")
+
+    season_mode = str(changes.get("seasonSaveMode") or "blob")
+    print("\n  Season save mode: 'blob' restores a season exactly as the game saved")
+    print("  it. Switch to 'round' only if a saved season will not reopen -- it keeps")
+    print("  your progress but sends less back.")
+    answer = input(f"  season save mode (blob/round) [{season_mode}]: ").strip().lower()
+    if answer == "round":
+        changes["seasonSaveMode"] = "round"
+    elif answer == "blob":
+        changes.pop("seasonSaveMode", None)
+    elif answer:
+        print("  must be 'blob' or 'round'; leaving it as it was")
+
+    if changes:
+        saved["diagnostics"] = changes
+    else:
+        saved.pop("diagnostics", None)
+    return saved
+
+
 def _set_balance(currency: str) -> None:
     """Set the coin or FIFA Point balance. Both live on the club row."""
     if not _require_idle() or not SAVE_PATH.is_file():
@@ -336,7 +375,8 @@ MENU = """
   6  Set coin balance                        [save]
   7  Set FIFA Point balance                  [save]
   8  Clear club, keep the starter squad      [save]
-  9  Reset all settings to defaults
+  9  Testing switches     (stat probe, season save mode)
+ 10  Reset all settings to defaults
   0  Exit
 """
 
@@ -375,6 +415,9 @@ def main() -> int:
         elif choice == "8":
             clear_club()
         elif choice == "9":
+            saved = edit_diagnostics(defaults, saved)
+            dirty = True
+        elif choice == "10":
             saved = reset_settings()
             dirty = False
         else:
