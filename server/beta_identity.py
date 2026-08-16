@@ -3217,6 +3217,37 @@ class BetaIdentityStore(LocalIdentityStore):
                 raw = ""
         return "round" if raw in {"round", "minimal", "off"} else "blob"
 
+    @staticmethod
+    def _no_current_season_id() -> int:
+        """A seasonId that deliberately matches no record in the served list.
+
+        Claiming a current season the client cannot load is what has broken this
+        screen every time it has been tried, and the 2026-08-16 16:53 crash dump
+        is the clearest instance: the client parsed seasonId/divisionId/round,
+        resolved seasonId 1 to the division-11 record, walked into its resume
+        path and read through a null pointer (access violation at
+        CardsDLLzf+0xc66dd, `cmp byte ptr [esi], 5` with esi = 0). The pointer is
+        the season state the client saved for itself -- which a club that has
+        never played a season does not have.
+
+        The A/B across this project's whole history says the same thing twice:
+
+        * BETA 2.26 served seasonId 2 against a list holding only id 1 -- it did
+          not resolve, and that is the *one* run where the screen opened, drew
+          its fixtures and played a match;
+        * the superseded tree served a resolving seasonId 1, and that era's
+          symptom was the menu bounce, then "seasons are currently unavailable",
+          with crash dumps.
+
+        So a fresh club reports no current season, and a seasonId is only claimed
+        once the client's own save exists to go with it -- which it does from the
+        first visit onward, because the screen writes that save before kickoff.
+        One past the ladder rather than 0: the proven-survivable value was above
+        the served ids, and 0 would decrement into the client's own -1 sentinel,
+        which is untested here.
+        """
+        return len(OFFLINE_SEASON_DIVISIONS) + 1
+
     def _season_user_document_locked(
         self, connection: sqlite3.Connection, persona_id: int
     ) -> dict[str, Any]:
@@ -3231,8 +3262,11 @@ class BetaIdentityStore(LocalIdentityStore):
             "divisionId": division,
             "round": max(1, min(int(matches), int(row["round_value"] or 1))),
         }
-        # Only a season that has actually been saved carries the client's blob; a
-        # fresh one stays at exactly the three members the capture proves parse.
+        # A seasonId is only claimed when the client's own save exists to back
+        # it; without one the season is reported as not current at all. See
+        # _no_current_season_id -- resolving to a record we cannot load is what
+        # crashed the client on 2026-08-16.
+        #
         # Each buffer is followed by its own version, which is the member order
         # the cup resume response had to be reshaped into to stop crashing.
         if str(row["season_data"] or "") and self.season_save_mode() == "blob":
@@ -3241,6 +3275,8 @@ class BetaIdentityStore(LocalIdentityStore):
             if str(row["progress_data"] or ""):
                 document["progressData"] = str(row["progress_data"])
                 document["progressDataVersion"] = max(1, int(row["progress_data_version"] or 1))
+        else:
+            document["seasonId"] = self._no_current_season_id()
         return document
 
     def current_season_division(self) -> int:
