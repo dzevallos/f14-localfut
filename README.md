@@ -74,9 +74,10 @@ and after every fixture, with a `PUT` the server answered by handing back the se
 *list* — so the save was parsed as a list request and discarded, while `season/user`
 replied from a seeded row nothing ever updated. It reported season 2 / division 10
 against a list holding only season 1 / division 11: nothing matched, nothing was ever
-underway. Progress now round-trips, and the ladder is eleven divisions with its own ten
-opponents each, ~60 average rating at the bottom climbing to the actual top ten — every
-division used to schedule the same ten European giants against a bronze starter squad.
+underway. Progress now round-trips, and the ladder is the retail one — Division 10 up to
+Division 1, each with its own ten opponents, ~60 average rating at the bottom climbing to
+the actual top ten. Every division used to schedule the same ten European giants against a
+bronze starter squad.
 
 **Player cards never recorded anything.** Goals and assists arrived with every match
 result and were written to a member the client does not read, and appearances were not
