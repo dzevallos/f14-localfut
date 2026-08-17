@@ -16,25 +16,28 @@ protections, never print credentials. Diagnostics against the installed game are
 
 ## 1. Start here
 
-Everything below is shipped in **0.4.5 beta** and passes all eight verifiers. Two things
-have never been observed in game and are the highest-value next step, in this order:
+Shipped in **0.4.8 beta**; all eight verifiers pass. 0.4.8 was in the user's hands for
+testing when this handoff was written — **check whether the red cards are gone before
+starting anything else**, because everything below assumes they are.
 
-1. **Play one offline season to the end and capture it.** Does the season come back
-   *underway* after a match, and does the ladder move the club from Division 10 to
-   Division 9 after ten fixtures? The server settles promotion itself; what is unproven is
-   whether the client adopts the division we report. `fut-season-request-beta2260` logs the
-   divisions served next to the club's actual division on every request, so the capture
-   answers it directly. If the ladder does not move, the fallback is to serve the current
-   tier's *content* under whatever division id the client asks for.
-2. **Run `FIFA14_PLAYER_STAT_PROBE` and screenshot one card.** Each card has five
-   unlabelled stat slots; the order in `PLAYER_CARD_STAT_INDEX` is inferred. The probe
-   serves 11/22/0/44/55 in slots 0–4; slot 2 must stay zero because FIFA treats any
-   red-card total as an active suspension. Read-only.
+The single unproven thing in the whole feature, in priority order:
 
-After those: staff on the transfer market (§7.2), then the pack manager (#6) or tournament
-names/icons (#8).
+1. **Play one offline season to the end and capture it.** Two questions in one run:
+   does the season come back **underway** after a match, and does the ladder move the club
+   from Division 10 to Division 9 after ten fixtures? The server settles promotion itself;
+   what has never been observed is whether the client adopts the division `season/user`
+   reports. `fut-season-request-beta2260` logs the divisions served next to the club's
+   actual division on every request, so one capture answers it. If the ladder does not
+   move, the fallback is to serve the current tier's *content* under whatever division id
+   the client asks for.
+2. **Staff on the transfer market** (§7.2) — the 316 cards are already extracted with
+   client-resolvable ids; what is left is the wire shape.
+3. Then **#9** (FIFA Point balance) and **#10** (chemistry not live-updating), which have
+   never been looked at, before the pack manager (#6) or tournament names/icons (#8).
 
----
+**Read §5 before touching Seasons or player cards.** Six releases in this area were spent
+re-learning rules that are now written there as constraints; every one of them cost a
+crash, a dead screen or a corrupted squad.
 
 ## 2. Where things live
 
@@ -364,15 +367,15 @@ stadiums, so there is nothing to sell — making them meaningful means provision
 club with only some cosmetics, which takes items away from existing clubs and is a product
 decision. There is no ball *card* table in the client's data at all.
 
-### 7.3 Player card stat slot order (#12, remainder) — CONFIRMED & RESOLVED
-`PLAYER_CARD_STAT_INDEX` = `goals: 0, assists: 1, redCards: 2, yellowCards: 3, gamesPlayed: 4`.
-Confirmed by direct disassembly of `CardsDLLzf.dll` at `0x1005f600`:
-- `+0x10` -> `PLAYER_GOALS%i` (slot 0)
-- `+0x11` -> `PLAYER_ASSISTS%i` (slot 1)
-- `+0x12` -> `PLAYER_REDCARDS%i` (slot 2)
-- `+0x13` -> `PLAYER_YELLOWCARDS%i` (slot 3)
-- `+0x14` -> `PLAYER_GAMESPLAYED%i` (slot 4)
-*Gotcha:* If `redCards > 0` on a card, FIFA 14 flags the player as suspended with a red card and blocks them from squad match selection. The debug probe `FIFA14_PLAYER_STAT_PROBE` previously injected 33 into slot 2, which caused the entire squad to appear suspended. Slot 2 is now 0 in probe sentinels.
+### 7.3 Player card stats (#12) — resolved
+The seven-slot mapping is in §5, taken from the code that writes the squad screen rather
+than from labels near the data. Goals, assists, appearances and cards now land where the
+game displays them, and legacy five-slot saves migrate on read.
+
+`FIFA14_PLAYER_STAT_PROBE` / `diagnostics.playerStatProbe` is no longer needed to settle
+the order and is kept only as an inspection aid; it sends 0 in slots 4 and 5 because a
+sentinel in either benches the whole squad. What is still worth confirming in game is the
+ordinary thing: that goals and appearances show up on a card after a match.
 
 ### 7.4 BUG-005 — intermittent bail-out during match setup
 "Could not reach Origin services" then a hang, once, 2026-08-14. Not a tracer stall (it
@@ -456,13 +459,29 @@ game; `tools/scan_fifa14_match_assets.py` does the same for kits, stadiums and b
 
 ## 10. Released
 
-`0.4.5 beta` is current (Latest). Take nothing earlier: **0.4 and 0.4.1** can fail a
-startup check at random, **0.4.2** crashes on entering Seasons, **0.4.3** reports "seasons
-are currently unavailable", **0.4.4** has the wrong ladder shape. All four carry a banner
-pointing forward. `0.2 beta` could not start at all; `0.2.1` fixed it.
+`0.4.8 beta` is current (Latest). **Take nothing earlier** — every 0.4.x before it has a
+banner pointing forward, and each was superseded for a real reason:
 
-Tester is `duckiest428`. Issues: **#1–5, #7 closed**; **#11 (partly), #12, #13** addressed
-in 0.4.x and awaiting confirmation; **#6, #8, #9 (FIFA Point balance), #10 (chemistry not
-live-updating)** open and untouched. Each of #11/#12/#13 has exactly one current comment
-pointing at the latest release — if you supersede a release, update those comments rather
-than stacking corrections on them.
+| build | why not |
+|---|---|
+| 0.4, 0.4.1 | a verifier fails at random, so the game will not start |
+| 0.4.2 | crashes on entering Seasons |
+| 0.4.3 | "seasons are currently unavailable" |
+| 0.4.4 | ladder had a Division 11, which is not a division |
+| 0.4.5 | restores a season's saved state into a different season |
+| 0.4.6 | resumes from the client's pre-kickoff stub |
+| 0.4.7 | every player who has played a match is drawn red-carded |
+
+`0.2 beta` could not start at all; `0.2.1` fixed it.
+
+**Releasing rapidly is what made that list.** Four of those seven shipped a fix reasoned
+from the newest symptom while the answer was already in the older evidence. If a fix is
+not backed by the code that consumes the field, or by a table of every observation
+including the ones that worked, it is a guess — say so in the notes rather than shipping
+it as a fix.
+
+Tester is `duckiest428`. Issues: **#1–5, #7, #11, #13 closed**; **#12** addressed and
+awaiting confirmation; **#6, #8, #9 (FIFA Point balance), #10 (chemistry not
+live-updating)** open, and #9/#10 have never been investigated. #12 has one current
+comment carrying the corrected mapping — if you supersede a release, update that comment
+rather than stacking corrections on it.
