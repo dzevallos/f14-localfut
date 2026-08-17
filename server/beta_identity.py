@@ -2583,17 +2583,14 @@ class BetaIdentityStore(LocalIdentityStore):
             # ever written. Games played is counted for the eleven that actually
             # started, which is the same set the contract decrement uses.
             if decrement_contracts:
-                # Red cards are deliberately NOT accumulated. Slot 2 is the one
-                # the client reads to decide a player is suspended and unavailable
-                # for selection -- it is current availability, not a career total.
-                # Writing a lifetime count there benches the card permanently, and
-                # it is the same slot that made an entire squad look red-carded
-                # when the stat probe stamped a sentinel into it. Suspension is
-                # the client's own `suspension` member and stays its business.
+                # Every one of these goes to a *display* slot. The two
+                # availability flags the client reads to bench a player -- slots
+                # 4 and 5 -- are never written; see PLAYER_CARD_STAT_INDEX.
                 bumps = {
                     "goals": match_goals,
                     "assists": match_assists,
                     "yellowCards": _submitted_stat("yellowCards"),
+                    "redCards": _submitted_stat("redCards"),
                     "gamesPlayed": 1 if item_id in starters else 0,
                 }
                 self._bump_card_stats(payload, bumps)

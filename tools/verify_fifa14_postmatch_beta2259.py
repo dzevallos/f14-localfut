@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "server"))
 sys.path.insert(0, str(ROOT))
 
 import beta_identity as beta_identity_module  # noqa: E402
+import local_identity as local_identity_module  # noqa: E402
 from beta_identity import (  # noqa: E402
     BetaIdentityStore,
     MATCH_RESULT_FLAT_COINS,
@@ -199,7 +200,8 @@ def main() -> int:
                     return [int(entry["value"]) for entry in row["itemData"]["statsList"]]
             raise SystemExit(f"card {item_id} vanished from the squad")
 
-        require(card_stats(scorer) == [0] * 5, f"a fresh card must start on zeroes: {card_stats(scorer)}")
+        slots = local_identity_module.PLAYER_STAT_COUNT
+        require(card_stats(scorer) == [0] * slots, f"a fresh card must start on zeroes: {card_stats(scorer)}")
         store.create_match({"squadId": 1, "type": "OFFLINE"})
         store.match_ready({"items": [{"id": item_id} for item_id in eleven]})
         stat_items = [{"id": item_id} for item_id in eleven] + [{"id": reserve}]
@@ -220,19 +222,22 @@ def main() -> int:
         require(all(int(row.get("redCards", 0)) == 1
                     for row in settled.get("items", []) if int(row["id"]) in submitted_reds),
                 f"a reported red card must be echoed back, not swallowed: {settled.get('items')}")
-        index = beta_identity_module.PLAYER_CARD_STAT_INDEX
+        index = local_identity_module.PLAYER_CARD_STAT_INDEX
         after_one = card_stats(scorer)
-        expected = [0] * 5
+        expected = [0] * slots
         expected[index["goals"]] = 2
         expected[index["assists"]] = 1
         expected[index["yellowCards"]] = 1
         expected[index["gamesPlayed"]] = 1
-        # Slot 2 stays zero even though the client reported a red card: it is what
-        # the client reads to bench a player, not a career total. Accumulating it
-        # would suspend the card for good.
-        expected[index["redCards"]] = 0
+        expected[index["redCards"]] = 1
+        # Slots 4 and 5 are the client's "currently carded" flags -- CURRENT_REDCARDS
+        # is 1 whenever slot 4 is above zero and the player cannot be selected. They
+        # are never ours to write, and an appearance landing in slot 4 is what drew a
+        # red card on all eleven players who had played (2026-08-17 capture).
+        require(after_one[4] == 0 and after_one[5] == 0,
+                f"the carded flags must stay clear: {after_one}")
         require(after_one == expected, f"card stats did not accumulate: {after_one} != {expected}")
-        require(card_stats(reserve) == [0] * 5,
+        require(card_stats(reserve) == [0] * slots,
                 f"a card that did not start must not be credited an appearance: {card_stats(reserve)}")
         # A retry of the same match must not double-count.
         store.settle_match_end({
@@ -248,7 +253,12 @@ def main() -> int:
         finally:
             _os.environ.pop("FIFA14_PLAYER_STAT_PROBE", None)
         probed = [int(e["value"]) for e in wire["players"][0]["itemData"]["statsList"]]
-        require(probed == [11, 22, 0, 44, 55], f"the stat probe did not stamp its safe sentinels: {probed}")
+        require(probed == list(local_identity_module.PLAYER_CARD_STAT_PROBE_VALUES),
+                f"the stat probe did not stamp its sentinels: {probed}")
+        # Slots 4 and 5 are CURRENT_REDCARDS / CURRENT_YELLOWCARDS -- a sentinel in
+        # either benches the entire squad, which is how the probe was first noticed.
+        require(probed[4] == 0 and probed[5] == 0,
+                f"the probe must never set the carded flags: {probed}")
         require(card_stats(scorer) == expected,
                 f"the stat probe overwrote stored career totals: {card_stats(scorer)}")
 

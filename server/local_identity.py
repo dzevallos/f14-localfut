@@ -236,29 +236,54 @@ def player_card_subtype(rare_flag: int) -> int:
         return 1 if int(rare_flag) else 0
     except (TypeError, ValueError):
         return 0
-PLAYER_STAT_COUNT = 5
+# A card's stat array is SEVEN entries, and the mapping below is read straight
+# out of the code that writes the squad screen's own indicators
+# (CardsDLLzf.dll ~0x10022300, each UI variable paired with the index it reads
+# through the accessor at 0x100d7540, which indexes [[card+0xC]+i*4+0xC4] --
+# i.e. `statsList`):
+#
+#   0  MATCH_PLAYED          4  CURRENT_REDCARDS     <- availability, not history
+#   1  GOAL_SCORED           5  CURRENT_YELLOWCARDS  <- availability, not history
+#   2  SEASON_YELLOWCARDS    6  GOAL_ASSISTED
+#   3  SEASON_REDCARDS
+#
+# Slots 4 and 5 are booleans the client turns into "this player is carded and
+# cannot be picked" -- `CURRENT_REDCARDS` is set to 1 when slot 4 is > 0 and to
+# -1 otherwise. **Never write them.** Writing games-played into slot 4 is what
+# put a red card on every player who had appeared: eleven cards in the
+# maintainer's save had slot 4 = 1, and eleven cards showed red.
+#
+# Two earlier readings of this array were wrong in the same way -- both assumed
+# five slots and inferred the order from string tables rather than from the code
+# that consumes it. Read the writer, not the labels.
+PLAYER_STAT_COUNT = 7
 # Attributes are ratings and stop at 99; a career total does not.
 PLAYER_STAT_MAX = 9999
-# Which slot of a card's five-entry `statsList`/`lifetimeStats` array holds what
-# (dzevallos/f14-localfut#12: goals and games played never accumulated, because
-# nothing ever wrote either array -- the settle path put goals in a
-# `lifetimeGoals` member that is not in the client's JSON key table at all).
-#
-# The 5-slot order is confirmed by CardsDLLzf.dll disassembly at 0x1005f600:
-#   +0x10 -> PLAYER_GOALS%i       (index 0)
-#   +0x11 -> PLAYER_ASSISTS%i     (index 1)
-#   +0x12 -> PLAYER_REDCARDS%i    (index 2)
-#   +0x13 -> PLAYER_YELLOWCARDS%i (index 3)
-#   +0x14 -> PLAYER_GAMESPLAYED%i (index 4)
-# Note: When redCards > 0 on a card, FIFA 14 considers the player suspended.
 PLAYER_CARD_STAT_INDEX = {
-    "goals": 0,
-    "assists": 1,
-    "redCards": 2,
-    "yellowCards": 3,
-    "gamesPlayed": 4,
+    "gamesPlayed": 0,
+    "goals": 1,
+    "yellowCards": 2,
+    "redCards": 3,
+    "assists": 6,
 }
-PLAYER_CARD_STAT_PROBE_VALUES = (11, 22, 0, 44, 55)
+# Slots 4 and 5 stay zero: they are the "currently carded" flags, and a sentinel
+# in either of them benches the whole squad.
+PLAYER_CARD_STAT_PROBE_VALUES = (11, 22, 33, 44, 0, 0, 66)
+# Saves written before the seven-slot layout was recovered hold five entries in
+# the order that was believed then -- goals, assists, redCards, yellowCards,
+# gamesPlayed. Appearances therefore sit in slot 4, which the client reads as
+# "currently sent off", so those cards come back red-carded until the values are
+# moved. Mapped rather than dropped: the totals are real, only their homes were
+# wrong.
+_LEGACY_STAT_SLOTS = (1, 6, 3, 2, 0)   # old index -> new index
+
+
+def _migrate_player_stats(values: list[int]) -> list[int]:
+    """Move a legacy five-slot stat array into the client's seven-slot layout."""
+    migrated = [0] * PLAYER_STAT_COUNT
+    for old_index, value in enumerate(values[:len(_LEGACY_STAT_SLOTS)]):
+        migrated[_LEGACY_STAT_SLOTS[old_index]] = int(value or 0)
+    return migrated
 
 
 def player_card_stat_probe() -> bool:
@@ -1930,14 +1955,20 @@ class LocalIdentityStore:
         )
         if not any(attributes):
             attributes = [rating] * PLAYER_ATTRIBUTE_COUNT
-        stats = self._array_values(
-            source.get("statsList", source.get("statsArray", [])), PLAYER_STAT_COUNT,
-            maximum=PLAYER_STAT_MAX,
-        )
-        lifetime_stats = self._array_values(
-            source.get("lifetimeStats", source.get("lifetimeStatsArray", [])), PLAYER_STAT_COUNT,
-            maximum=PLAYER_STAT_MAX,
-        )
+        def _card_stats(*keys: str) -> list[int]:
+            raw = next((source[key] for key in keys if isinstance(source.get(key), list)), [])
+            values = self._array_values(raw, PLAYER_STAT_COUNT, maximum=PLAYER_STAT_MAX)
+            if len(raw) == 5:
+                values = _migrate_player_stats(values)
+            # Slots 4 and 5 are the client's "currently carded" flags, never ours
+            # to set. Clearing them here also repairs a save that already has an
+            # appearance count sitting in slot 4.
+            values[4] = 0
+            values[5] = 0
+            return values
+
+        stats = _card_stats("statsList", "statsArray")
+        lifetime_stats = _card_stats("lifetimeStats", "lifetimeStatsArray")
 
         preferred_position = str(source.get("preferredPosition") or player.get("position") or "CM").upper()
         if preferred_position in {"SUB", "RES", "", "UNKNOWN"}:

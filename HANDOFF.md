@@ -201,9 +201,31 @@ pre-match squad screen draws every one of them behind a red card. `_season_progr
 mirrors the cup's `_tournament_progress_is_resumable`, which paid for this lesson in BETA
 2.18: round 1 is never resumable, and a later round still has to carry a player table.
 
-**Never write a career total into stat slot 2.** The client reads it as *current
-availability* — any non-zero value marks the player suspended and blocks selection — not as
-a lifetime red-card count. That is also why the stat probe sends 0 in slot 2.
+**A card's stat array is SEVEN slots, and two of them are availability flags.**
+Read straight out of the code that writes the squad screen (`CardsDLLzf.dll` ~`0x10022300`,
+each UI variable paired with the index it reads through the accessor at `0x100d7540`,
+which indexes `[[card+0xC]+i*4+0xC4]` — i.e. `statsList`):
+
+| index | UI variable | |
+|---|---|---|
+| 0 | `MATCH_PLAYED` | |
+| 1 | `GOAL_SCORED` | |
+| 2 | `SEASON_YELLOWCARDS` | |
+| 3 | `SEASON_REDCARDS` | |
+| **4** | **`CURRENT_REDCARDS`** | **never write** — set to 1 whenever slot 4 > 0, and the player cannot be selected |
+| **5** | **`CURRENT_YELLOWCARDS`** | **never write** |
+| 6 | `GOAL_ASSISTED` | |
+
+Writing games-played into slot 4 put a red card on every player who had appeared —
+eleven cards in the maintainer's save had slot 4 = 1, and eleven showed red. Saves from
+before this was recovered hold five slots in the old assumed order and are migrated on
+read (`_migrate_player_stats`), with 4 and 5 forced clear.
+
+**Two earlier readings of this array were wrong the same way**: both assumed five slots
+and inferred the order from string tables — one from the match-stat enum's layout, one
+from the SeasonAdapter's `PLAYER_*%i` block at `0x1005f600`, which is the *season screen's*
+per-player list, not the card's. Read the code that consumes a field, not the labels near
+it.
 
 **A fresh club has no active cosmetics** until the retail client selects them. Verifier-
 pinned; do not fabricate one.
