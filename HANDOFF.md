@@ -193,6 +193,14 @@ pre-match squad screen behind a red card (2026-08-16 23:32 capture). "Migrate wi
 losing progress" is the intuitive behaviour and the wrong one: there is no way to carry a
 season into a different season.
 
+**A pre-kickoff save is not a resumable season.** The Seasons screen writes twice per
+fixture and the first write happens *before* kickoff: 16 bytes whose player table is
+empty, against ~576 bytes carrying an entry per player mid-season. Serving the stub back
+as a resumable season gives the client a season no player has a record in, and the
+pre-match squad screen draws every one of them behind a red card. `_season_progress_is_resumable`
+mirrors the cup's `_tournament_progress_is_resumable`, which paid for this lesson in BETA
+2.18: round 1 is never resumable, and a later round still has to carry a player table.
+
 **Never write a career total into stat slot 2.** The client reads it as *current
 availability* — any non-zero value marks the player suspended and blocks selection — not as
 a lifetime red-card count. That is also why the stat probe sends 0 in slot 2.

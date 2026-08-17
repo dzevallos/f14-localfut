@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import gzip
 import json
 import math
 import os
@@ -3284,6 +3285,41 @@ class BetaIdentityStore(LocalIdentityStore):
                 raw = ""
         return "round" if raw in {"round", "minimal", "off"} else "blob"
 
+    @staticmethod
+    def _season_progress_is_resumable(round_value: int, season_data: str) -> bool:
+        """Reject the pre-kickoff stub the Seasons screen writes when it opens.
+
+        The same shape of mistake as BETA 2.18's cup bug, one feature over, and
+        the cup's `_tournament_progress_is_resumable` is the precedent.
+
+        The client saves twice per fixture, and the first of those is written
+        *before* kickoff: 16 bytes whose player table is empty. A real mid-season
+        save is ~576 bytes carrying an entry per player. Handing the stub back as
+        a resumable season gives the client a season in which no player has a
+        record, and the pre-match squad screen draws every one of them with a red
+        card (2026-08-16 23:53 capture, on a save holding exactly that stub).
+
+        Round 1 is not resumable by definition -- there is nothing to come back
+        to before the first fixture -- and a later round still has to carry a
+        player table, because "a later round is not enough on its own" is the
+        lesson the cup path already paid for.
+        """
+        raw = str(season_data or "").strip()
+        if not raw or int(round_value) <= 1:
+            return False
+        try:
+            blob = base64.b64decode(raw, validate=False)
+            payload = blob[4:]
+            if payload[:2] == b"\x1f\x8b":
+                payload = gzip.decompress(payload)
+        except Exception:
+            # Undecodable but past the first fixture: trust the round rather than
+            # throw away a save we simply cannot inspect.
+            return True
+        if len(payload) <= 32:
+            return False
+        return len(payload) <= 8 or payload[8] != 0
+
     def _season_user_document_locked(
         self, connection: sqlite3.Connection, persona_id: int
     ) -> dict[str, Any]:
@@ -3311,7 +3347,10 @@ class BetaIdentityStore(LocalIdentityStore):
         #
         # Each buffer is followed by its own version, which is the member order
         # the cup resume response had to be reshaped into to stop crashing.
-        has_save = bool(str(row["season_data"] or "")) and self.season_save_mode() == "blob"
+        resumable = self._season_progress_is_resumable(
+            int(row["round_value"] or 1), str(row["season_data"] or "")
+        )
+        has_save = resumable and self.season_save_mode() == "blob"
         document: dict[str, Any] = {
             "seasonId": _season_ladder_id(division) if has_save else -1,
             "divisionId": division,

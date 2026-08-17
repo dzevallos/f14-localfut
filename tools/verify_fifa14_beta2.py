@@ -394,14 +394,30 @@ def main() -> int:
             if not pool.issubset(valid_team_ids):
                 fail(f"division {row['divisionId']} schedules a club absent from the catalogue: {sorted(pool)}")
 
+        # The Seasons screen writes a pre-kickoff stub when it opens: round 1, a
+        # 16-byte payload whose player table is empty. Serving that back as a
+        # resumable season gives the client a season no player has a record in,
+        # and the pre-match squad screen draws every one of them red-carded. Same
+        # shape as the cup's BETA 2.18 bug.
+        stub = "EAAAAAUBAAAAAAAAAAAAAAAAAAA="
+        store.update_offline_season_user(
+            1, store.entry_season_division(),
+            {"round": 1, "dataVersion": 1, "data": stub, "progressDataVersion": 1, "progressData": "AwAAAAwJAA=="},
+        )
+        opened = store.offline_season_user()
+        if "data" in opened or int(opened["seasonId"]) in held_ids:
+            fail(f"a pre-kickoff stub must not be advertised as a resumable season: {opened}")
+        # A real mid-season save: length-prefixed, carrying a player table. The
+        # size and the non-zero entry count are what separate it from the stub.
+        mid_season = "QAAAAAUBAAAAAQMAEgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
         saved = store.update_offline_season_user(
             1, store.entry_season_division(),
-            {"round": 2, "dataVersion": 1, "data": "QUJD", "progressDataVersion": 1, "progressData": "AwAAAAsIAA=="},
+            {"round": 2, "dataVersion": 1, "data": mid_season, "progressDataVersion": 1, "progressData": "AwAAAAsIAA=="},
         )
         if list(saved) != ["round", "dataVersion", "data", "progressDataVersion", "progressData"]:
             fail(f"a season save must be echoed in the client's own write order: {saved}")
         resumed = store.offline_season_user()
-        if int(resumed["round"]) != 2 or resumed.get("data") != "QUJD":
+        if int(resumed["round"]) != 2 or resumed.get("data") != mid_season:
             fail(f"a saved season must come back underway at the round it saved: {resumed}")
         if list(resumed).index("data") > list(resumed).index("dataVersion"):
             fail(f"dataVersion decodes the buffer before it, so data must come first: {list(resumed)}")
