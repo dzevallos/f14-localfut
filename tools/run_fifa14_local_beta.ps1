@@ -256,48 +256,61 @@ if ($regressionVerifyExitCode -ne 0) {
 }
 Write-Host "BETA 2.25.9 regression verifier passed: second-entry CardsDLL rearm + consumable inventory/stats + transfer pile 5 + Clear Sold route." -ForegroundColor Green
 
-Write-Host "Scanning the retail patch archive for the normal FUT Store frontend (read-only diagnostic)..."
-New-Item -ItemType Directory -Path (Split-Path -Parent $storeUiExtract) -Force | Out-Null
-$storeUiJson = & $python $storeUiScanner --game-root $GameRoot --output $storeUiExtract
-if ($LASTEXITCODE -ne 0) {
-    Write-Warning "Store frontend static scanner returned a non-zero status. FUT launch will continue."
-} elseif ($storeUiJson) {
-    try {
-        $storeUiState = ($storeUiJson -join "`n") | ConvertFrom-Json
-        if ($storeUiState.error) {
-            Write-Warning ("Store frontend static scan could not inspect patch.big: " + $storeUiState.error)
-        } else {
-            Write-Host ("Store frontend static trace: " + $storeUiState.matchCount + " matching blobs from " + $storeUiState.recordCount + " patch records.")
+if (-not $SkipStaticExtract -and -not (Test-Path -LiteralPath $storeUiExtract)) {
+    Write-Host "Scanning the retail patch archive for the normal FUT Store frontend (read-only diagnostic)..."
+    New-Item -ItemType Directory -Path (Split-Path -Parent $storeUiExtract) -Force | Out-Null
+    $storeUiJson = & $python $storeUiScanner --game-root $GameRoot --output $storeUiExtract
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Store frontend static scanner returned a non-zero status. FUT launch will continue."
+    } elseif ($storeUiJson) {
+        try {
+            $storeUiState = ($storeUiJson -join "`n") | ConvertFrom-Json
+            if ($storeUiState.error) {
+                Write-Warning ("Store frontend static scan could not inspect patch.big: " + $storeUiState.error)
+            } else {
+                Write-Host ("Store frontend static trace: " + $storeUiState.matchCount + " matching blobs from " + $storeUiState.recordCount + " patch records.")
+            }
+        } catch {
+            Write-Warning "Store frontend scanner output could not be parsed; the raw artifact will still be included."
         }
-    } catch {
-        Write-Warning "Store frontend scanner output could not be parsed; the raw artifact will still be included."
     }
+} elseif (Test-Path -LiteralPath $storeUiExtract) {
+    Write-Host "Store frontend static trace artifact already exists; skipping read-only scan." -ForegroundColor DarkGray
 }
 
-Write-Host "Scanning the retail patch archive for Offline Seasons/Tournaments frontend contracts (read-only diagnostic)..."
-New-Item -ItemType Directory -Path (Split-Path -Parent $competitionUiExtract) -Force | Out-Null
-$competitionUiJson = & $python $competitionUiScanner --game-root $GameRoot --output $competitionUiExtract
-if ($LASTEXITCODE -ne 0) {
-    Write-Warning "Competition frontend static scanner returned a non-zero status. FUT launch will continue."
-} elseif ($competitionUiJson) {
-    try {
-        $competitionUiState = ($competitionUiJson -join "`n") | ConvertFrom-Json
-        if ($competitionUiState.error) {
-            Write-Warning ("Competition frontend static scan could not inspect patch.big: " + $competitionUiState.error)
-        } else {
-            Write-Host ("Competition frontend static trace: " + $competitionUiState.matchCount + " matching blobs from " + $competitionUiState.recordCount + " patch records.")
+if (-not $SkipStaticExtract -and -not (Test-Path -LiteralPath $competitionUiExtract)) {
+    Write-Host "Scanning the retail patch archive for Offline Seasons/Tournaments frontend contracts (read-only diagnostic)..."
+    New-Item -ItemType Directory -Path (Split-Path -Parent $competitionUiExtract) -Force | Out-Null
+    $competitionUiJson = & $python $competitionUiScanner --game-root $GameRoot --output $competitionUiExtract
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Competition frontend static scanner returned a non-zero status. FUT launch will continue."
+    } elseif ($competitionUiJson) {
+        try {
+            $competitionUiState = ($competitionUiJson -join "`n") | ConvertFrom-Json
+            if ($competitionUiState.error) {
+                Write-Warning ("Competition frontend static scan could not inspect patch.big: " + $competitionUiState.error)
+            } else {
+                Write-Host ("Competition frontend static trace: " + $competitionUiState.matchCount + " matching blobs from " + $competitionUiState.recordCount + " patch records.")
+            }
+        } catch {
+            Write-Warning "Competition frontend scanner output could not be parsed; the raw artifact will still be included."
         }
-    } catch {
-        Write-Warning "Competition frontend scanner output could not be parsed; the raw artifact will still be included."
     }
+} elseif (Test-Path -LiteralPath $competitionUiExtract) {
+    Write-Host "Competition frontend static trace artifact already exists; skipping read-only scan." -ForegroundColor DarkGray
 }
 
-Write-Host "Resolving native FIFA 14 kits, stadiums and badges from the installed retail databases (read-only)..." -ForegroundColor Cyan
-New-Item -ItemType Directory -Path (Split-Path -Parent $matchAssetReport) -Force | Out-Null
-$matchAssetJson = & $python $matchAssetScanner --game-root $GameRoot --output $matchAssetReport
-$matchAssetExitCode = $LASTEXITCODE
-if (-not (Test-Path -LiteralPath $matchAssetReport)) {
-    throw "Native match-asset scan did not produce $matchAssetReport. Refusing to launch with fabricated cosmetic IDs."
+if (-not $SkipStaticExtract -and -not (Test-Path -LiteralPath $matchAssetReport)) {
+    Write-Host "Resolving native FIFA 14 kits, stadiums and badges from the installed retail databases (read-only)..." -ForegroundColor Cyan
+    New-Item -ItemType Directory -Path (Split-Path -Parent $matchAssetReport) -Force | Out-Null
+    $matchAssetJson = & $python $matchAssetScanner --game-root $GameRoot --output $matchAssetReport
+    $matchAssetExitCode = $LASTEXITCODE
+    if (-not (Test-Path -LiteralPath $matchAssetReport)) {
+        throw "Native match-asset scan did not produce $matchAssetReport. Refusing to launch with fabricated cosmetic IDs."
+    }
+} else {
+    Write-Host "Using cached native FIFA 14 match assets..." -ForegroundColor Cyan
+    $matchAssetExitCode = 0
 }
 try {
     $matchAssetState = Get-Content -LiteralPath $matchAssetReport -Raw | ConvertFrom-Json

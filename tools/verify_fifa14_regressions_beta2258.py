@@ -137,6 +137,18 @@ def main() -> int:
         for family in ("goldif", "goldblue", "motm", "toty"):
             require(pack_families[family] > 0, f"100k simulation never emitted {family}: {pack_families}")
 
+    # BETA 2.26.3. A season that actually resumes writes nothing before kickoff,
+    # so the season-fixture detector must key off the Seasons screen *read*, not
+    # only the save. Keying off the save alone turned the tally into a race with
+    # the previous match and dropped half the fixtures (2026-08-17 04:30 capture:
+    # 2 of 4 counted, server on 3 while the client had advanced to round 5).
+    season_source = (ROOT / "server" / "beta_identity.py").read_text(encoding="utf-8")
+    require("self._season_screen_seen_at = float(time.time())" in season_source,
+            "season/user must stamp when the Seasons screen was read")
+    require('seen_at = max(int(row["saved_at"] or 0), int(self._season_screen_seen_at or 0))'
+            in season_source,
+            "the season-fixture detector must accept the screen read as well as the save")
+
     probe_source = (ROOT / "server" / "probe.py").read_text(encoding="utf-8")
     require('include_consumables_default=(path_without_query == "/ut/game/fifa14/clubUser")' in probe_source,
             "/clubUser consumable cache preload route missing")

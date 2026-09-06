@@ -30,7 +30,8 @@
       "minQuality": "bronze",
       "playerSlots": 3,
       "safeLivePool": "futbin-bronze-base-cards",
-      "description": "12 items, including 3 players and 9 consumable/club items, with 3 Rares."
+      "description": "12 items, including 3 players and 9 consumable/club items, with 3 Rares.",
+      "staffSlots": 1
     },
     {
       "packType": 3,
@@ -60,7 +61,8 @@
       "minQuality": "silver",
       "playerSlots": 3,
       "safeLivePool": "futbin-silver-base-cards",
-      "description": "12 items, including 3 players and 9 consumable/club items, with 3 Rares."
+      "description": "12 items, including 3 players and 9 consumable/club items, with 3 Rares.",
+      "staffSlots": 1
     },
     {
       "packType": 5,
@@ -90,7 +92,8 @@
       "minQuality": "gold",
       "playerSlots": 3,
       "safeLivePool": "futbin-gold-base-cards",
-      "description": "12 items, including 3 players and 9 consumable/club items, with 3 Rares."
+      "description": "12 items, including 3 players and 9 consumable/club items, with 3 Rares.",
+      "staffSlots": 1
     },
     {
       "packType": 101,
@@ -105,7 +108,8 @@
       "minQuality": "gold",
       "playerSlots": 8,
       "safeLivePool": "futbin-gold-base-cards",
-      "description": "24 items, including 8 players and 16 consumable/club items, with 7 Rares."
+      "description": "24 items, including 8 players and 16 consumable/club items, with 7 Rares.",
+      "staffSlots": 1
     },
     {
       "packType": 102,
@@ -135,7 +139,8 @@
       "minQuality": "gold",
       "playerSlots": 10,
       "safeLivePool": "futbin-gold-base-cards",
-      "description": "30 items, including 10 players and 20 consumable/club items, with 18 Rares."
+      "description": "30 items, including 10 players and 20 consumable/club items, with 18 Rares.",
+      "staffSlots": 1
     },
     {
       "packType": 104,

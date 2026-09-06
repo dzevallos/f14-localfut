@@ -49,6 +49,7 @@ def _defaults() -> dict:
         "'tournamentPrizes':{int(t['tournamentId']):{'name':t['name'],'prize':int(t['prize']),"
         "'repeatPrize':int(t['repeatPrize'])} for t in b.OFFLINE_TOURNAMENTS},"
         "'matchRewardMode':b.MATCH_REWARD_MODE,"
+        "'matchLengthMin':b.DEFAULT_MATCH_LENGTH_MIN,"
         "'market':{'rotationFraction':l.MARKET_ROTATION_FRACTION,"
         "'rotationMinutes':l.MARKET_ROTATION_SECONDS//60,"
         "'consumablePrice':l.MARKET_CONSUMABLE_BUY_NOW}}))" % SERVER
@@ -72,6 +73,7 @@ def _effective(defaults: dict, saved: dict) -> dict:
     return {
         "matchRewards": rewards,
         "matchRewardMode": saved.get("matchRewardMode", defaults.get("matchRewardMode", "flat")),
+        "matchLengthMin": saved.get("matchLengthMin", defaults.get("matchLengthMin", 6)),
         "tournamentPrizes": prizes,
         "market": market,
     }
@@ -154,6 +156,9 @@ def show(defaults: dict, saved: dict) -> None:
         value = int(effective["matchRewards"].get(key, 0))
         mark = "*" if key in (saved.get("matchRewards") or {}) else " "
         print(f"   {mark} {key:<5} {value:>12,}")
+    length = int(effective.get("matchLengthMin", 6))
+    length_mark = "*" if "matchLengthMin" in saved else " "
+    print(f"\n {length_mark} Match length   {length} min per half ({length * 2} min total)")
     print("\n  Tournament payouts (first clear / repeat)")
     for tournament_id in sorted(effective["tournamentPrizes"]):
         row = effective["tournamentPrizes"][tournament_id]
@@ -218,6 +223,20 @@ def edit_match_rewards(defaults: dict, saved: dict) -> dict:
     if changes:
         saved["matchRewards"] = changes
     print("\n  Note: cup rounds advertise and pay the WIN amount, by design.")
+    return saved
+
+
+def edit_match_length(defaults: dict, saved: dict) -> dict:
+    current = int(_effective(defaults, saved).get("matchLengthMin", 6))
+    print("\n  Half length for offline FUT matches. Blank keeps the current value.")
+    print("  Retail offers 1-11 minutes per half, so a match is twice this.")
+    print("  FUT ignores this on the wire, so the tracer writes it into the game's own")
+    print("  half-length setting when a match starts, and puts the original back when the")
+    print("  match ends -- your Kick Off length is left as you had it. Leave this unset")
+    print("  and nothing is forced at all.")
+    value = _ask_int("minutes per half", current, low=1, high=11)
+    if value is not None:
+        saved["matchLengthMin"] = value
     return saved
 
 
@@ -370,13 +389,14 @@ MENU = """
   1  Show current settings
   2  Match reward mode    (flat / dynamic)
   3  Match rewards        (win / draw / loss / dnf)
-  4  Tournament payouts   (first clear / repeat)
-  5  Transfer market      (rotation, consumable price)
-  6  Set coin balance                        [save]
-  7  Set FIFA Point balance                  [save]
-  8  Clear club, keep the starter squad      [save]
-  9  Testing switches     (stat probe, season save mode)
- 10  Reset all settings to defaults
+  4  Match length         (minutes per half)
+  5  Tournament payouts   (first clear / repeat)
+  6  Transfer market      (rotation, consumable price)
+  7  Set coin balance                        [save]
+  8  Set FIFA Point balance                  [save]
+  9  Clear club, keep the starter squad      [save]
+ 10  Testing switches     (stat probe, season save mode)
+ 11  Reset all settings to defaults
   0  Exit
 """
 
@@ -403,21 +423,24 @@ def main() -> int:
             saved = edit_match_rewards(defaults, saved)
             dirty = True
         elif choice == "4":
-            saved = edit_tournament_prizes(defaults, saved)
+            saved = edit_match_length(defaults, saved)
             dirty = True
         elif choice == "5":
-            saved = edit_market(defaults, saved)
+            saved = edit_tournament_prizes(defaults, saved)
             dirty = True
         elif choice == "6":
-            _set_balance("COINS")
+            saved = edit_market(defaults, saved)
+            dirty = True
         elif choice == "7":
-            _set_balance("POINTS")
+            _set_balance("COINS")
         elif choice == "8":
-            clear_club()
+            _set_balance("POINTS")
         elif choice == "9":
+            clear_club()
+        elif choice == "10":
             saved = edit_diagnostics(defaults, saved)
             dirty = True
-        elif choice == "10":
+        elif choice == "11":
             saved = reset_settings()
             dirty = False
         else:

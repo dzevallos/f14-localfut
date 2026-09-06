@@ -354,6 +354,75 @@ def main() -> int:
         cheap = store.market_bid(int(chem["tradeId"]), li.MARKET_CONSUMABLE_BUY_NOW - 1)
         require(cheap.get("tradeState") != "closed", "a bid under the flat price still bought the consumable")
 
+        # Staff on the transfer market (dzevallos/f14-localfut#11 remainder, BETA
+        # 2.26.22). The tab's own tokens come from the 2026-08-16 tester capture
+        # (`type=staff&cat=manager|headCoach|fitnessCoach|GKCoach`); the counts
+        # are the install's own cards_ng_db.db tables as extracted by
+        # tools/scan_fifa14_staff_cards.py. The ItemData shape follows Impulsum14's
+        # staff builders, the one shape known to render on this client, and every
+        # key it carries resolves in CardsDLLzf.dll's key table (checked 2026-09-05).
+        require(len(li.STAFF_CATALOG) == 316, f"staff catalogue is not the install's 316 cards: {len(li.STAFF_CATALOG)}")
+        everyone = store.market_search({"type": ["staff"], "start": ["0"], "num": ["100"]})
+        require(int(everyone["total"]) == 316, f"type=staff does not list the whole staff catalogue: {everyone['total']}")
+        for token, kind, expected in (
+            ("manager", "manager", 166), ("headCoach", "headCoach", 36), ("GKCoach", "gkCoach", 36),
+            ("fitnessCoach", "fitnessCoach", 36), ("physio", "physio", 42),
+        ):
+            page = store.market_search({"type": ["staff"], "cat": [token], "start": ["0"], "num": ["12"]})
+            require(int(page["total"]) == expected, f"staff cat={token} served {page['total']} of {expected}")
+            require(page["auctionInfo"] and all(a["itemData"]["itemType"] == kind for a in page["auctionInfo"]),
+                    f"staff cat={token} served the wrong family: {[a['itemData']['itemType'] for a in page['auctionInfo']]}")
+            require(all(int(a["buyNowPrice"]) >= 150 and a["tradeState"] == "active" for a in page["auctionInfo"]),
+                    f"staff cat={token} listings are not buyable: {page['auctionInfo'][:1]}")
+        require(int(store.market_search({"type": ["staff"], "cat": ["kit"]}).get("total", 0)) == 0,
+                "an unknown staff category must stay empty rather than fall back to everything")
+        forbidden_staff_keys = {"category", "kind", "quality", "class", "dataSource", "localPackSchema",
+                                "cat", "value", "carddbid", "attribute", "posbonus", "fieldpos",
+                                "talkrating", "negotiation", "formationid"}
+        physio = store.market_search({"type": ["staff"], "cat": ["physio"], "num": ["1"]})["auctionInfo"][0]["itemData"]
+        require(not forbidden_staff_keys.intersection(physio), f"catalogue-only fields leaked onto the staff wire: {sorted(forbidden_staff_keys.intersection(physio))}")
+        require(physio["cardsubtypeid"] == 7 and len(physio["attributeList"]) == 7
+                and sum(int(entry["value"]) for entry in physio["attributeList"]) == int(physio["amount"]) > 0
+                and sum(int(physio[f"Attribute{i}"]) for i in range(1, 7)) == int(physio["amount"]),
+                f"physio boost is not carried the way the client reads it: {physio}")
+        manager_page = store.market_search({"type": ["staff"], "cat": ["manager"], "num": ["1"]})["auctionInfo"][0]
+        require(manager_page["itemData"]["cardsubtypeid"] == 4 and manager_page["itemData"]["attributeList"] == [],
+                f"manager ItemData drifted from the Impulsum14 shape: {manager_page['itemData']}")
+        coins_before = store.currencies()["credits"]
+        bought = store.market_bid(int(manager_page["tradeId"]), 0)
+        require(bought.get("tradeState") == "closed", f"staff Buy Now did not close: {bought}")
+        require(store.currencies()["credits"] == coins_before - int(manager_page["buyNowPrice"]),
+                "staff purchase debited the wrong amount")
+        staff_item = int(bought["itemData"]["id"])
+        require(any(int(x.get("id", 0)) == staff_item for x in store.purchased_items().get("itemData", [])),
+                "bought manager is missing from New Items")
+        moved = store.move_items([{"id": staff_item, "pile": 7}])
+        require(moved["itemData"][0]["success"] is True, f"bought manager could not be sent to the club: {moved}")
+        for token in ("manager", "staff"):
+            club_page = store.club_items({"type": [token]})
+            require(any(int(x.get("id", 0)) == staff_item for x in club_page.get("itemData", [])),
+                    f"My Club type={token} does not list the bought manager: {club_page}")
+        require(int(store.club_items({"type": ["physio"]}).get("total", 0)) == 0,
+                "My Club type=physio listed a manager")
+        require(store.market_bid(int(manager_page["tradeId"]), 10).get("tradeState") != "closed",
+                "a bid under the flat price still bought the staff card")
+        require(len(store.market_status([int(manager_page["tradeId"])])["auctionInfo"]) == 1,
+                "market_status cannot resolve a staff trade id")
+        # Packs: the Upgrade packs' managerSlots (always in the catalogue, never
+        # honoured before) and the new staffSlots both come out of the consumable
+        # share, so the advertised player count holds.
+        with closing(sqlite3.connect(store.database)) as con, con:
+            upgrade = store._generate_pack_contents_locked(con, pack_id=900_100, definition=li.PACK_DEFINITIONS[107])
+            premium = store._generate_pack_contents_locked(con, pack_id=900_101, definition=li.PACK_DEFINITIONS[6])
+        require(sum(item["itemType"] == "manager" for item in upgrade) == 1 and len(upgrade) == 12,
+                f"Gold Upgrade pack does not carry exactly one manager: {[i['itemType'] for i in upgrade]}")
+        require(sum(item["itemType"] in li.STAFF_ITEM_TYPES[1:] for item in premium) == 1
+                and sum(item["itemType"] == "player" for item in premium) == 3 and len(premium) == 12,
+                f"Premium Gold pack composition drifted: {[i['itemType'] for i in premium]}")
+        require(not any(forbidden_staff_keys.intersection(item) for item in upgrade + premium
+                        if item["itemType"] in li.STAFF_ITEM_TYPES),
+                "catalogue-only staff fields leaked into a pack")
+
         # Pack-weight contract remains untouched: lenient specials, hard max 2.
         definition = li.PACK_DEFINITIONS[105]
         special_counts: list[int] = []

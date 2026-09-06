@@ -1,14 +1,17 @@
 {
   "schema": "fifa14-v240-safe-special-player-catalog",
-  "note": "Special variants matched conservatively to the resolved native FIFA 14 base-player identity. WEFUT record ids remain lookup/provenance only. Variant resourceId uses the FUT definition/revision bit layout so assetId remains the footballer identity.",
-  "sourceSpecialRows": 2319,
-  "resolvedSpecialRows": 1820,
-  "unresolvedSpecialRows": 499,
+  "note": "Special variants matched conservatively to the resolved native FIFA 14 base-player identity. WEFUT record ids remain lookup/provenance only. Variant resourceId uses the FUT definition/revision bit layout so assetId remains the footballer identity. Repair scan: added verified Ochoa/Kaká variants and repaired selected high-confidence asset/name joins.",
+  "sourceSpecialRows": 2321,
+  "resolvedSpecialRows": 1824,
+  "unresolvedSpecialRows": 497,
   "matchMethods": {
-    "name+nation": 1774,
+    "name+nation": 1766,
     "unique-nation-name-token": 8,
-    "name": 12,
-    "slug": 26
+    "name": 9,
+    "manual-historical-transfer-fix": 1,
+    "slug": 14,
+    "manual-verified-repair": 25,
+    "manual-project-update": 1
   },
   "rareFlagMap": {
     "bronzeif": 3,
@@ -2763,7 +2766,7 @@
       "name": "Robert Lewandowski",
       "rating": 89,
       "position": "ST",
-      "teamId": 22,
+      "teamId": 21,
       "leagueId": 19,
       "nation": 37,
       "nationName": "Poland",
@@ -2782,8 +2785,9 @@
       "specialCard": true,
       "wefutRecordId": 17182,
       "wefutLink": "https://wefut.com/player/14/17182/robert-lewandowski",
-      "matchMethod": "name+nation",
-      "sourceIndex": 103
+      "matchMethod": "manual-historical-transfer-fix",
+      "sourceIndex": 103,
+      "dataSource": "Update_DB_v1 historical Bayern variant"
     },
     {
       "assetId": 153079,
@@ -5486,16 +5490,16 @@
       "sourceIndex": 239
     },
     {
-      "assetId": 138726,
-      "resourceId": 50470374,
-      "definitionId": 50470374,
+      "assetId": 178393,
+      "resourceId": 50510041,
+      "definitionId": 50510041,
       "version": 2,
       "name": "Alessio Cerci",
       "rating": 86,
       "position": "CF",
-      "teamId": 10,
-      "leagueId": 13,
-      "nation": 14,
+      "teamId": 54,
+      "leagueId": 31,
+      "nation": 27,
       "nationName": "Italy",
       "rareFlag": 11,
       "playStyle": 0,
@@ -5512,7 +5516,7 @@
       "specialCard": true,
       "wefutRecordId": 13909,
       "wefutLink": "https://wefut.com/player/14/13909/alessio-cerci",
-      "matchMethod": "name+nation",
+      "matchMethod": "manual-verified-repair",
       "sourceIndex": 241
     },
     {
@@ -6176,17 +6180,17 @@
       "sourceIndex": 263
     },
     {
-      "assetId": 110842,
-      "resourceId": 83996922,
-      "definitionId": 83996922,
+      "assetId": 188152,
+      "resourceId": 84074232,
+      "definitionId": 84074232,
       "version": 4,
       "name": "Oscar",
       "rating": 86,
       "position": "RM",
-      "teamId": 462,
-      "leagueId": 53,
-      "nation": 45,
-      "nationName": "Spain",
+      "teamId": 5,
+      "leagueId": 13,
+      "nation": 54,
+      "nationName": "Brazil",
       "rareFlag": 3,
       "playStyle": 0,
       "attributes": [
@@ -6202,7 +6206,7 @@
       "specialCard": true,
       "wefutRecordId": 15355,
       "wefutLink": "https://wefut.com/player/14/15355/oscar",
-      "matchMethod": "name",
+      "matchMethod": "manual-verified-repair",
       "sourceIndex": 251
     },
     {
@@ -7466,17 +7470,17 @@
       "sourceIndex": 329
     },
     {
-      "assetId": 110842,
-      "resourceId": 50442490,
-      "definitionId": 50442490,
+      "assetId": 188152,
+      "resourceId": 50519800,
+      "definitionId": 50519800,
       "version": 2,
       "name": "Oscar",
       "rating": 85,
       "position": "CAM",
-      "teamId": 462,
-      "leagueId": 53,
-      "nation": 45,
-      "nationName": "Spain",
+      "teamId": 5,
+      "leagueId": 13,
+      "nation": 54,
+      "nationName": "Brazil",
       "rareFlag": 3,
       "playStyle": 0,
       "attributes": [
@@ -7492,7 +7496,7 @@
       "specialCard": true,
       "wefutRecordId": 13496,
       "wefutLink": "https://wefut.com/player/14/13496/oscar",
-      "matchMethod": "name",
+      "matchMethod": "manual-verified-repair",
       "sourceIndex": 316
     },
     {
@@ -8096,17 +8100,17 @@
       "sourceIndex": 351
     },
     {
-      "assetId": 110842,
-      "resourceId": 67219706,
-      "definitionId": 67219706,
+      "assetId": 188152,
+      "resourceId": 67297016,
+      "definitionId": 67297016,
       "version": 3,
       "name": "Oscar",
       "rating": 84,
       "position": "CAM",
-      "teamId": 462,
-      "leagueId": 53,
-      "nation": 45,
-      "nationName": "Spain",
+      "teamId": 5,
+      "leagueId": 13,
+      "nation": 54,
+      "nationName": "Brazil",
       "rareFlag": 13,
       "playStyle": 0,
       "attributes": [
@@ -8122,7 +8126,7 @@
       "specialCard": true,
       "wefutRecordId": 14269,
       "wefutLink": "https://wefut.com/player/14/14269/oscar",
-      "matchMethod": "name",
+      "matchMethod": "manual-verified-repair",
       "sourceIndex": 363
     },
     {
@@ -8793,8 +8797,8 @@
       "name": "David Villa",
       "rating": 84,
       "position": "LM",
-      "teamId": 112224,
-      "leagueId": 351,
+      "teamId": 240,
+      "leagueId": 53,
       "nation": 45,
       "nationName": "Spain",
       "rareFlag": 3,
@@ -8812,7 +8816,7 @@
       "specialCard": true,
       "wefutRecordId": 15387,
       "wefutLink": "https://wefut.com/player/14/15387/david-villa",
-      "matchMethod": "name+nation",
+      "matchMethod": "manual-verified-repair",
       "sourceIndex": 386
     },
     {
@@ -11036,15 +11040,15 @@
       "sourceIndex": 488
     },
     {
-      "assetId": 178056,
-      "resourceId": 50509704,
-      "definitionId": 50509704,
+      "assetId": 138449,
+      "resourceId": 50470097,
+      "definitionId": 50470097,
       "version": 2,
       "name": "Kaká",
       "rating": 83,
       "position": "CAM",
-      "teamId": 242,
-      "leagueId": 54,
+      "teamId": 47,
+      "leagueId": 31,
       "nation": 54,
       "nationName": "Brazil",
       "rareFlag": 3,
@@ -11062,7 +11066,7 @@
       "specialCard": true,
       "wefutRecordId": 12285,
       "wefutLink": "https://wefut.com/player/14/12285/kaka",
-      "matchMethod": "slug",
+      "matchMethod": "manual-verified-repair",
       "sourceIndex": 492
     },
     {
@@ -11523,8 +11527,8 @@
       "name": "David Villa",
       "rating": 82,
       "position": "LW",
-      "teamId": 112224,
-      "leagueId": 351,
+      "teamId": 240,
+      "leagueId": 53,
       "nation": 45,
       "nationName": "Spain",
       "rareFlag": 13,
@@ -12926,16 +12930,16 @@
       "sourceIndex": 637
     },
     {
-      "assetId": 190584,
-      "resourceId": 67299448,
-      "definitionId": 67299448,
+      "assetId": 103935,
+      "resourceId": 67212799,
+      "definitionId": 67212799,
       "version": 3,
       "name": "Alberto Aquilani",
       "rating": 82,
       "position": "CM",
-      "teamId": 243,
-      "leagueId": 53,
-      "nation": 45,
+      "teamId": 110374,
+      "leagueId": 31,
+      "nation": 27,
       "nationName": "Italy",
       "rareFlag": 3,
       "playStyle": 0,
@@ -12952,7 +12956,7 @@
       "specialCard": true,
       "wefutRecordId": 13882,
       "wefutLink": "https://wefut.com/player/14/13882/alberto-aquilani",
-      "matchMethod": "name+nation",
+      "matchMethod": "manual-verified-repair",
       "sourceIndex": 609
     },
     {
@@ -14246,15 +14250,15 @@
       "sourceIndex": 716
     },
     {
-      "assetId": 178056,
-      "resourceId": 67286920,
-      "definitionId": 67286920,
-      "version": 3,
+      "assetId": 138449,
+      "resourceId": 100801745,
+      "definitionId": 100801745,
+      "version": 5,
       "name": "Kaká",
       "rating": 81,
       "position": "CAM",
-      "teamId": 242,
-      "leagueId": 54,
+      "teamId": 47,
+      "leagueId": 31,
       "nation": 54,
       "nationName": "Brazil",
       "rareFlag": 13,
@@ -14272,7 +14276,7 @@
       "specialCard": true,
       "wefutRecordId": 14354,
       "wefutLink": "https://wefut.com/player/14/14354/kaka",
-      "matchMethod": "slug",
+      "matchMethod": "manual-verified-repair",
       "sourceIndex": 720
     },
     {
@@ -14846,16 +14850,16 @@
       "sourceIndex": 756
     },
     {
-      "assetId": 190584,
-      "resourceId": 50522232,
-      "definitionId": 50522232,
+      "assetId": 103935,
+      "resourceId": 50435583,
+      "definitionId": 50435583,
       "version": 2,
       "name": "Alberto Aquilani",
       "rating": 81,
       "position": "CM",
-      "teamId": 243,
-      "leagueId": 53,
-      "nation": 45,
+      "teamId": 110374,
+      "leagueId": 31,
+      "nation": 27,
       "nationName": "Italy",
       "rareFlag": 3,
       "playStyle": 0,
@@ -14872,7 +14876,7 @@
       "specialCard": true,
       "wefutRecordId": 12349,
       "wefutLink": "https://wefut.com/player/14/12349/alberto-aquilani",
-      "matchMethod": "name+nation",
+      "matchMethod": "manual-verified-repair",
       "sourceIndex": 760
     },
     {
@@ -15776,16 +15780,16 @@
       "sourceIndex": 745
     },
     {
-      "assetId": 190584,
-      "resourceId": 84076664,
-      "definitionId": 84076664,
+      "assetId": 103935,
+      "resourceId": 83990015,
+      "definitionId": 83990015,
       "version": 4,
       "name": "Alberto Aquilani",
       "rating": 80,
       "position": "CM",
-      "teamId": 243,
-      "leagueId": 53,
-      "nation": 45,
+      "teamId": 110374,
+      "leagueId": 31,
+      "nation": 27,
       "nationName": "Italy",
       "rareFlag": 13,
       "playStyle": 0,
@@ -15802,20 +15806,20 @@
       "specialCard": true,
       "wefutRecordId": 14409,
       "wefutLink": "https://wefut.com/player/14/14409/alberto-aquilani",
-      "matchMethod": "name+nation",
+      "matchMethod": "manual-verified-repair",
       "sourceIndex": 873
     },
     {
-      "assetId": 138726,
-      "resourceId": 67247590,
-      "definitionId": 67247590,
+      "assetId": 178393,
+      "resourceId": 67287257,
+      "definitionId": 67287257,
       "version": 3,
       "name": "Alessio Cerci",
       "rating": 80,
       "position": "RF",
-      "teamId": 10,
-      "leagueId": 13,
-      "nation": 14,
+      "teamId": 54,
+      "leagueId": 31,
+      "nation": 27,
       "nationName": "Italy",
       "rareFlag": 13,
       "playStyle": 0,
@@ -15832,7 +15836,7 @@
       "specialCard": true,
       "wefutRecordId": 14410,
       "wefutLink": "https://wefut.com/player/14/14410/alessio-cerci",
-      "matchMethod": "name+nation",
+      "matchMethod": "manual-verified-repair",
       "sourceIndex": 872
     },
     {
@@ -16686,7 +16690,7 @@
       "teamId": 100769,
       "leagueId": 67,
       "nation": 40,
-      "nationName": "Korea Republic",
+      "nationName": "Russia",
       "rareFlag": 13,
       "playStyle": 0,
       "attributes": [
@@ -16702,7 +16706,7 @@
       "specialCard": true,
       "wefutRecordId": 14418,
       "wefutLink": "https://wefut.com/player/14/14418/roman-shirokov",
-      "matchMethod": "slug",
+      "matchMethod": "manual-verified-repair",
       "sourceIndex": 865
     },
     {
@@ -18176,16 +18180,16 @@
       "sourceIndex": 945
     },
     {
-      "assetId": 167614,
-      "resourceId": 50499262,
-      "definitionId": 50499262,
+      "assetId": 39943,
+      "resourceId": 50371591,
+      "definitionId": 50371591,
       "version": 2,
       "name": "Ji Sung Park",
       "rating": 80,
       "position": "CM",
-      "teamId": 100769,
-      "leagueId": 67,
-      "nation": 40,
+      "teamId": 247,
+      "leagueId": 10,
+      "nation": 167,
       "nationName": "Korea Republic",
       "rareFlag": 3,
       "playStyle": 0,
@@ -18202,7 +18206,7 @@
       "specialCard": true,
       "wefutRecordId": 13250,
       "wefutLink": "https://wefut.com/player/14/13250/ji-sung-park",
-      "matchMethod": "name+nation",
+      "matchMethod": "manual-verified-repair",
       "sourceIndex": 955
     },
     {
@@ -18876,7 +18880,7 @@
       "teamId": 100769,
       "leagueId": 67,
       "nation": 40,
-      "nationName": "Korea Republic",
+      "nationName": "Russia",
       "rareFlag": 3,
       "playStyle": 0,
       "attributes": [
@@ -18892,7 +18896,7 @@
       "specialCard": true,
       "wefutRecordId": 13511,
       "wefutLink": "https://wefut.com/player/14/13511/roman-shirokov",
-      "matchMethod": "slug",
+      "matchMethod": "manual-verified-repair",
       "sourceIndex": 943
     },
     {
@@ -19896,7 +19900,7 @@
       "teamId": 10,
       "leagueId": 13,
       "nation": 14,
-      "nationName": "Italy",
+      "nationName": "England",
       "rareFlag": 13,
       "playStyle": 0,
       "attributes": [
@@ -19912,7 +19916,7 @@
       "specialCard": true,
       "wefutRecordId": 14442,
       "wefutLink": "https://wefut.com/player/14/14442/joleon-lescott",
-      "matchMethod": "slug",
+      "matchMethod": "manual-verified-repair",
       "sourceIndex": 1105
     },
     {
@@ -20196,7 +20200,7 @@
       "teamId": 23,
       "leagueId": 19,
       "nation": 21,
-      "nationName": "Brazil",
+      "nationName": "Germany",
       "rareFlag": 13,
       "playStyle": 0,
       "attributes": [
@@ -20212,7 +20216,7 @@
       "specialCard": true,
       "wefutRecordId": 14448,
       "wefutLink": "https://wefut.com/player/14/14448/max-kruse",
-      "matchMethod": "slug",
+      "matchMethod": "manual-verified-repair",
       "sourceIndex": 1099
     },
     {
@@ -29976,7 +29980,7 @@
       "teamId": 100765,
       "leagueId": 67,
       "nation": 57,
-      "nationName": "Germany",
+      "nationName": "Ecuador",
       "rareFlag": 13,
       "playStyle": 0,
       "attributes": [
@@ -29992,7 +29996,7 @@
       "specialCard": true,
       "wefutRecordId": 14677,
       "wefutLink": "https://wefut.com/player/14/14677/felipe-caicedo",
-      "matchMethod": "slug",
+      "matchMethod": "manual-verified-repair",
       "sourceIndex": 2215
     },
     {
@@ -39246,7 +39250,7 @@
       "teamId": 598,
       "leagueId": 7,
       "nation": 54,
-      "nationName": "Philippines",
+      "nationName": "Brazil",
       "rareFlag": 3,
       "playStyle": 0,
       "attributes": [
@@ -39262,7 +39266,7 @@
       "specialCard": true,
       "wefutRecordId": 11862,
       "wefutLink": "https://wefut.com/player/14/11862/antonio-carlos",
-      "matchMethod": "slug",
+      "matchMethod": "manual-verified-repair",
       "sourceIndex": 3278
     },
     {
@@ -41736,7 +41740,7 @@
       "teamId": 312,
       "leagueId": 67,
       "nation": 195,
-      "nationName": "Brazil",
+      "nationName": "Australia",
       "rareFlag": 13,
       "playStyle": 0,
       "attributes": [
@@ -41752,7 +41756,7 @@
       "specialCard": true,
       "wefutRecordId": 14905,
       "wefutLink": "https://wefut.com/player/14/14905/luke-wilkshire",
-      "matchMethod": "slug",
+      "matchMethod": "manual-verified-repair",
       "sourceIndex": 3790
     },
     {
@@ -45876,7 +45880,7 @@
       "teamId": 1053,
       "leagueId": 7,
       "nation": 55,
-      "nationName": "Brazil",
+      "nationName": "Chile",
       "rareFlag": 13,
       "playStyle": 0,
       "attributes": [
@@ -45892,7 +45896,7 @@
       "specialCard": true,
       "wefutRecordId": 15037,
       "wefutLink": "https://wefut.com/player/14/15037/eugenio-mena",
-      "matchMethod": "slug",
+      "matchMethod": "manual-verified-repair",
       "sourceIndex": 4957
     },
     {
@@ -47706,7 +47710,7 @@
       "teamId": 29,
       "leagueId": 20,
       "nation": 22,
-      "nationName": "Colombia",
+      "nationName": "Greece",
       "rareFlag": 13,
       "playStyle": 0,
       "attributes": [
@@ -47722,7 +47726,7 @@
       "specialCard": true,
       "wefutRecordId": 15090,
       "wefutLink": "https://wefut.com/player/14/15090/konstantinos-fortounis",
-      "matchMethod": "slug",
+      "matchMethod": "manual-verified-repair",
       "sourceIndex": 5516
     },
     {
@@ -50466,7 +50470,7 @@
       "teamId": 1925,
       "leagueId": 60,
       "nation": 14,
-      "nationName": "Korea Republic",
+      "nationName": "England",
       "rareFlag": 11,
       "playStyle": 0,
       "attributes": [
@@ -50482,7 +50486,7 @@
       "specialCard": true,
       "wefutRecordId": 13950,
       "wefutLink": "https://wefut.com/player/14/13950/adam-forshaw",
-      "matchMethod": "slug",
+      "matchMethod": "manual-verified-repair",
       "sourceIndex": 9101
     },
     {
@@ -54624,6 +54628,122 @@
       "wefutLink": "https://wefut.com/player/14/15261/nick-carle",
       "matchMethod": "name+nation",
       "sourceIndex": 11417
+    },
+    {
+      "assetId": 167495,
+      "resourceId": 117608007,
+      "definitionId": 117608007,
+      "version": 6,
+      "name": "Manuel Neuer",
+      "rating": 94,
+      "position": "GK",
+      "teamId": 21,
+      "leagueId": 19,
+      "nation": 21,
+      "nationName": "Germany",
+      "rareFlag": 5,
+      "playStyle": 0,
+      "attributes": [
+        95,
+        89,
+        96,
+        94,
+        61,
+        89
+      ],
+      "quality": "gold",
+      "cardType": "toty",
+      "specialCard": true,
+      "matchMethod": "manual-project-update",
+      "dataSource": "Update_DB_v1 historical Bayern special variant"
+    },
+    {
+      "assetId": 140233,
+      "resourceId": 50471881,
+      "definitionId": 50471881,
+      "version": 2,
+      "name": "Guillermo Ochoa",
+      "rating": 80,
+      "position": "GK",
+      "teamId": 614,
+      "leagueId": 16,
+      "nation": 83,
+      "nationName": "Mexico",
+      "rareFlag": 3,
+      "playStyle": 0,
+      "attributes": [
+        86,
+        71,
+        76,
+        87,
+        47,
+        77
+      ],
+      "quality": "gold",
+      "cardType": "goldif",
+      "specialCard": true,
+      "wefutRecordId": 13506,
+      "wefutLink": "https://wefut.com/player/14/13506/guillermo-ochoa",
+      "matchMethod": "manual-verified-repair",
+      "dataSource": "WeFUT FIFA 14 Team of the Week"
+    },
+    {
+      "assetId": 140233,
+      "resourceId": 67249097,
+      "definitionId": 67249097,
+      "version": 3,
+      "name": "Guillermo Ochoa",
+      "rating": 81,
+      "position": "GK",
+      "teamId": 614,
+      "leagueId": 16,
+      "nation": 83,
+      "nationName": "Mexico",
+      "rareFlag": 7,
+      "playStyle": 0,
+      "attributes": [
+        88,
+        74,
+        76,
+        90,
+        47,
+        80
+      ],
+      "quality": "gold",
+      "cardType": "green",
+      "specialCard": true,
+      "wefutRecordId": 15349,
+      "wefutLink": "https://wefut.com/player/14/15349/guillermo-ochoa",
+      "matchMethod": "manual-verified-repair",
+      "dataSource": "WeFUT FIFA 14 iMOTM"
+    },
+    {
+      "assetId": 138449,
+      "resourceId": 67247313,
+      "definitionId": 67247313,
+      "version": 3,
+      "name": "Kaká",
+      "rating": 84,
+      "position": "CAM",
+      "teamId": 47,
+      "leagueId": 31,
+      "nation": 54,
+      "nationName": "Brazil",
+      "rareFlag": 3,
+      "playStyle": 0,
+      "attributes": [
+        72,
+        87,
+        84,
+        88,
+        47,
+        54
+      ],
+      "quality": "gold",
+      "cardType": "goldif",
+      "specialCard": true,
+      "matchMethod": "manual-verified-repair",
+      "dataSource": "WeFUT FIFA 14 Team of the Week"
     }
   ],
   "unresolved": [
@@ -56506,12 +56626,6 @@
       "link": "https://wefut.com/player/14/15402/tim-krul"
     },
     {
-      "name": "Guillermo Ochoa",
-      "card": "green",
-      "nation": "Mexico",
-      "link": "https://wefut.com/player/14/15349/guillermo-ochoa"
-    },
-    {
       "name": "Kevin Trapp",
       "card": "goldif",
       "nation": "Germany",
@@ -56588,12 +56702,6 @@
       "card": "goldif",
       "nation": "Germany",
       "link": "https://wefut.com/player/14/13987/kevin-trapp"
-    },
-    {
-      "name": "Guillermo Ochoa",
-      "card": "goldif",
-      "nation": "Mexico",
-      "link": "https://wefut.com/player/14/13506/guillermo-ochoa"
     },
     {
       "name": "Benoît Costil",

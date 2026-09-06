@@ -16,25 +16,33 @@ protections, never print credentials. Diagnostics against the installed game are
 
 ## 1. Start here
 
-Shipped in **0.4.8 beta**; all eight verifiers pass. 0.4.8 was in the user's hands for
+Shipped in **0.4.9 beta** (BETA 2.26.2 through 2.26.22); all eight verifiers pass. 0.4.8 was in the user's hands for
 testing when this handoff was written — **check whether the red cards are gone before
 starting anything else**, because everything below assumes they are.
 
 The single unproven thing in the whole feature, in priority order:
 
 1. **Play one offline season to the end and capture it.** Two questions in one run:
-   does the season come back **underway** after a match, and does the ladder move the club
-   from Division 10 to Division 9 after ten fixtures? The server settles promotion itself;
+   does the season come back **underway** after a match? **[VERIFIED: Yes, after the match `season/user` returned `seasonId: 1, round: 2` with the `data` blob, and the UI showed Division 0 which is expected for the unplaced tier to preserve the save]**
+   does the ladder move the club from Division 10 to Division 9 after ten fixtures? **[PENDING: The user played 1 match; we need to finish the season to verify promotion.]** The server settles promotion itself;
    what has never been observed is whether the client adopts the division `season/user`
    reports. `fut-season-request-beta2260` logs the divisions served next to the club's
    actual division on every request, so one capture answers it. If the ladder does not
    move, the fallback is to serve the current tier's *content* under whatever division id
    the client asks for.
-2. **Staff on the transfer market** (§7.2) — the 316 cards are already extracted with
+2. **Staff on the transfer market** (§7.2) — served since BETA 2.26.22; needs one capture of the tab and a pack.
    client-resolvable ids; what is left is the wire shape.
 3. Then **#9** (FIFA Point balance) and **#10** (chemistry not live-updating), which have
    never been looked at, before the pack manager (#6) or tournament names/icons (#8).
 
+- **2026-09-05:** four carry-overs from Impulsum14 (BETA 2.26.21-22, all verifier-covered,
+  none yet seen in game): the `progressdata` key (§5); **staff on the transfer market and
+  in packs** (§7.2, now closed pending a capture); the **season tally reconciles to the
+  client's round** on every save (§7.1b); and the cup trophy document carries Impulsum's
+  `locString`/`assetName`/`silName` members beside ours (§7.6). Impulsum14's own tree
+  lives at `<workspace>\Impulsum14-1.0` (read-only reference; its README says
+  its own divisions are broken and cups crash when underway, so take wire shapes and data
+  from it, not season logic).
 **Read §5 before touching Seasons or player cards.** Six releases in this area were spent
 re-learning rules that are now written there as constraints; every one of them cost a
 crash, a dead screen or a corrupted squad.
@@ -170,6 +178,19 @@ Each of these cost a crash or a dead screen to learn.
   | 2 | 10 | `_global.FAIL` when list only has id 1 |
   | 1 | 11 | access violation reading null at `CardsDLLzf+0xc66dd` when data buffer was empty |
   | 12 | 11 | "seasons are currently unavailable" |
+
+**The progress buffer is `progressdata`, all lowercase (BETA 2.26.21, 2026-09-05).**
+CardsDLL's JSON key table has an exact `progressdata` string and no `progressData`; the
+2026-08-20 capture shows the camelCase key resolving to id **614**, the id every unknown key
+gets (`wins`, `fifaPoints`, `badgeId`, `deviceId` all land there), while `progressDataVersion`
+resolves to 396. The client PUTs camelCase and reads lowercase. `season/user` and both save
+echoes now emit `progressdata` (still before its version member); writes are accepted in
+either casing (`_progress_data_from`). Found by cross-reading Impulsum14's `Seasons.cs`, whose
+other key indices (round 429, dataVersion 134, progressDataVersion 396) match our trace exactly.
+**Unproven in game** -- every resume served before this carried a null progress buffer, so
+the next Seasons capture is the one that says what, if anything, changes. The cup document on
+the wire is unaffected: `sitecustomize.py` strips it to `{round, tournamentData, dataVersion}`.
+The same 614 list says `fifaPoints` is not a real key either -- a lead for issue #9.
 
 **Buffer before its version.** This parser family reads a response as a stream, and a
 version member decodes *the buffer immediately before it*. The cup resume response had to
@@ -315,6 +336,22 @@ path, keeps the wallet, clears the W-D-L record, and must delete
 a real install because the club owns the whole cosmetic catalogue — count *players* to
 judge a wipe.
 
+**Staff (BETA 2.26.22).** The 316 cards in `server/fifa14-staff-catalog.v2411.json`
+(166 managers, 36 head coaches, 36 GK coaches, 36 fitness coaches, 42 physios, every
+`resourceId` the install's own `carddbid`) are served on `transfermarket?type=staff&cat=
+manager|headCoach|GKCoach|fitnessCoach|physio` (the tab's own tokens from the 2026-08-16
+capture), always in stock at a flat price by rating, one copy each, trade ids from
+`MARKET_STAFF_TRADE_ID_BASE`. Buying puts the card in New Items; My Club lists it under
+`type=manager|staff|headcoach|gkcoach|physio|fitnesscoach`, and the first owned manager fills
+the squad's one-element `manager` array. Packs: the Upgrade packs' `managerSlots` (in the
+catalogue all along, never honoured) and a new `staffSlots: 1` on the three Premium packs
+and the Jumbo Premium Gold / Mega packs, both taken from the consumable share so the player
+count holds. The ItemData is Impulsum14's `BuildManagerItem`/`BuildStaffItem` shape and
+every key on it resolves in CardsDLL's key table; physios and fitness coaches carry their
+boost in `attributeList` plus `Attribute1..6`/`statBonus`/`bonus`/`posMods`/`position`/
+`gkPositioning`. `manager-catalog.v237.json` stays `liveEmissionEnabled: false` (verifier-
+pinned); the staff catalogue is the verified source.
+
 **Economy.** `MATCH_RESULT_FLAT_COINS` WIN 15000 / DRAW 1000 / LOSS 750, DNF configurable.
 `MATCH_REWARD_MODE` flat or dynamic. Cup prizes 50k/25k → 2.5M/750k first clear / repeat.
 
@@ -342,6 +379,11 @@ division vector out of that object (`+0x1c` → the `&divisionList=` builder at
 place: the list serves the club's current division *alongside* whatever was asked for.
 If a restored season breaks the screen, `diagnostics.seasonSaveMode: "round"` drops back to
 the three members known to parse without losing the stored save.
+
+**BETA 2.26.22 reconciles the tally to the client on every save** (Impulsum14's
+`Seasons.SaveProgress` rule): a save of round N sets `matches_played` to N-1, counting any
+fixtures we missed as losses and trimming a tally that ran ahead. Points are never adjusted --
+only what we did not see, pessimistically.
 
 ### 7.2 Staff on the transfer market (#11, remainder)
 Unblocked — the client ships the real tables, and `carddbid` *is* the FUT resource id, so
@@ -398,6 +440,14 @@ reaches the FUT locstrings parser, so it has a separate unidentified consumer. *
 switch to trans-unit/XLIFF** — a verifier guards it, that format rendered NOT FOUND.
 Remaining: instrument CardsDLL's generic response path, or decompress `Data\loc\locale.big`.
 
+**BETA 2.26.22 adds Impulsum14's members to the cup trophy document** served for
+`/fut/items/pc/71000NN.json`: `tournamentId`, `tournamentType`, `assetName` (`trophy_1100_gold`
+for cup 1, four designs apart per cup), `silName` and `locString: [{lang: ENG_US, label}]`,
+alongside the existing `NAME`/`IMAGEFILE_*` members. All resolve in the key table. Whether
+the label reaches the screen is unproven; Impulsum's README does not list blank names as a
+bug, which is the only evidence. `assetName` points at art we have not located in the
+client's UI data.
+
 ### 7.7 #6 — pack manager (feature)
 Self-give and editable store packs are close to free; the generator exists and pack
 definitions already carry price/contents/weighting. Tournament pack *rewards* are risky —
@@ -406,7 +456,10 @@ awarding an item means a different award type, which is what broke Seasons.
 ### 7.8 Smaller open questions
 - Match length: the menu label follows our `matchlength`, gameplay ignores it (`HALF_LENGTH`
   lives in the client's `eGSParams`). Left at 6 so the label does not lie. A runtime
-  override via the tracer would work; **not** an archive write.
+  override via the tracer would work; **not** an archive write. The current memory override
+  in the tracer (which hooks the settings array at e.g. `0x10294cb8`) does not affect FUT gameplay;
+  matches still run at 6 minutes. The tracer now dumps `half-length-setter` (RVA `0x663dc0`)
+  and `game-setting-reader` to help locate the real `eGSParams` override.
 - Does round difficulty reach the AI, or is it only a label? Bronze Cup round 1 is the
   cheapest test.
 - Is Legendary (5) really the ceiling? The client clamps to its own `MIN_/MAX_DIFFICULTY_LEVEL`.
@@ -459,7 +512,7 @@ game; `tools/scan_fifa14_match_assets.py` does the same for kits, stadiums and b
 
 ## 10. Released
 
-`0.4.8 beta` is current (Latest). **Take nothing earlier** — every 0.4.x before it has a
+`0.4.9 beta` is current (Latest); 0.4.8 still has the broken season resume. **Take nothing earlier** — every 0.4.x before it has a
 banner pointing forward, and each was superseded for a real reason:
 
 | build | why not |

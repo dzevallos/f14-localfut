@@ -33,6 +33,7 @@ MANAGER_CATALOG_PATH = Path(__file__).with_name("manager-catalog.v237.json")
 SPECIAL_CATALOG_PATH = Path(__file__).with_name("fifa14-special-catalog.v240.json")
 LEGEND_CATALOG_PATH = Path(__file__).with_name("fifa14-legend-catalog.v24013.json")
 CONSUMABLE_CATALOG_PATH = Path(__file__).with_name("fifa14-consumable-catalog.v2412.json")
+STAFF_CATALOG_PATH = Path(__file__).with_name("fifa14-staff-catalog.v2411.json")
 
 
 def _diagnostic(message: str) -> None:
@@ -158,6 +159,57 @@ MARKET_CONSUMABLE_TYPES = frozenset({"development", "training", "consumable", "c
 # The Club Items tab asks for everything equippable in one query rather than one
 # type at a time. `custom` is the badge family, as club_items already treats it.
 EQUIPPABLE_ITEM_TYPES = ("kit", "stadium", "custom", "ball")
+
+# Staff cards (dzevallos/f14-localfut#11 remainder). The catalogue is extracted
+# read-only from the install's own cards_ng_db.db by tools/scan_fifa14_staff_cards.py,
+# so every resourceId is a carddbid the client can resolve -- the BUG-004 "DB
+# ERROR" mechanism cannot apply. The ItemData shape is modelled on Impulsum14's
+# BuildManagerItem/BuildStaffItem (the only staff shape known to render on this
+# client) and every key it emits was checked against CardsDLLzf.dll's own key
+# table on 2026-09-05: Attribute1..6, statBonus, bonus, posMods, position,
+# gkPositioning, amount, cardsubtypeid, attributeList, nationid all resolve.
+STAFF_CATALOG_DOCUMENT = _load_json(STAFF_CATALOG_PATH)
+STAFF_ITEM_TYPES = ("manager", "headCoach", "gkCoach", "fitnessCoach", "physio")
+# cardsubtypeid per staff family, as Impulsum14 ships them.
+STAFF_CARD_SUBTYPES = {"manager": 4, "headCoach": 5, "gkCoach": 6, "physio": 7, "fitnessCoach": 8}
+STAFF_CATALOG = [
+    row for kind in STAFF_ITEM_TYPES
+    for row in (STAFF_CATALOG_DOCUMENT.get("staff") or {}).get(kind, [])
+    if isinstance(row, dict) and int(row.get("resourceId", 0) or 0) > 0
+    and str(row.get("itemType", "")) == kind
+]
+STAFF_BY_RESOURCE = {int(row["resourceId"]): row for row in STAFF_CATALOG}
+MARKET_STAFF_INDEX = {int(row["resourceId"]): index for index, row in enumerate(STAFF_CATALOG)}
+MARKET_STAFF_TRADE_ID_BASE = 1_960_000_000
+MARKET_STAFF_ITEM_ID_BASE = 183_000_000_000
+MARKET_STAFF_TYPES = frozenset({"staff"})
+# The client's own market `cat` tokens (2026-08-16 tester capture:
+# `type=staff&cat=manager|headCoach|fitnessCoach|GKCoach`, plus the scan tool's
+# `physio`), and the My Club `type` tokens Impulsum14 accepts for the same tab.
+_STAFF_KINDS_BY_TOKEN = {
+    "": STAFF_ITEM_TYPES, "all": STAFF_ITEM_TYPES, "any": STAFF_ITEM_TYPES, "staff": STAFF_ITEM_TYPES,
+    "manager": ("manager",), "managers": ("manager",),
+    "headcoach": ("headCoach",), "coach": ("headCoach",),
+    "gkcoach": ("gkCoach",), "goalkeepercoach": ("gkCoach",), "gk": ("gkCoach",),
+    "fitnesscoach": ("fitnessCoach",), "fitness": ("fitnessCoach",),
+    "physio": ("physio",), "physios": ("physio",),
+}
+
+
+def _staff_kinds_for_token(token: str) -> tuple[str, ...] | None:
+    """Which staff families a `cat`/`type` token names; None for a token we do not know."""
+    key = re.sub(r"[^a-z]", "", str(token or "").casefold())
+    return _STAFF_KINDS_BY_TOKEN.get(key)
+
+
+def _staff_price(card: dict[str, Any]) -> int:
+    """Flat shop price by rating, rare cards a quarter more; a manager is never
+    gated behind a rotation any more than a contract is."""
+    rating = int(card.get("value", 0) or 0)
+    price = 200 + max(0, rating - 50) * 60
+    if int(card.get("rare", 0) or 0) > 0:
+        price = int(price * 1.25)
+    return max(150, (price + 25) // 50 * 50)
 EQUIPPABLE_TYPE_ALIASES = frozenset({"equippables", "equippable", "clubitems", "club"})
 
 
@@ -2749,6 +2801,81 @@ class LocalIdentityStore:
         payload["discardValue"] = max(0, int(payload.get("discardValue", 0)))
         return payload
 
+    @classmethod
+    def _weighted_staff(cls, rng: random.Random, *, quality: str, kind: str, rare_slot: bool,
+                        excluded_resources: set[int] | None = None) -> dict[str, Any]:
+        """A staff card for a pack slot: the slot's quality band first, then its
+        rarity, relaxing each in turn so a slot is never left empty."""
+        quality = str(quality).lower()
+        kinds = STAFF_ITEM_TYPES if kind == "staff" else (kind,)
+        family = [row for row in STAFF_CATALOG if str(row.get("itemType", "")) in kinds]
+        if kind == "staff":
+            # A pack's staff slot is a coach or a physio; managers have their own slot.
+            family = [row for row in family if str(row.get("itemType", "")) != "manager"]
+        if not family:
+            raise RuntimeError(f"no {kind} cards in the staff catalogue")
+        excluded = excluded_resources or set()
+        fresh = [row for row in family if int(row.get("resourceId", 0) or 0) not in excluded] or family
+        banded = [row for row in fresh if cls._quality_for_rating(int(row.get("value", 0) or 0)) == quality] or fresh
+        matched = [row for row in banded if (int(row.get("rare", 0) or 0) > 0) == bool(rare_slot)] or banded
+        return rng.choice(matched)
+
+    def _local_staff_payload(self, *, item_id: int, card: dict[str, Any], pile: int = 6,
+                             item_state: str = "free") -> dict[str, Any]:
+        """Staff ItemData on the wire.
+
+        Modelled on Impulsum14's BuildManagerItem/BuildStaffItem, which is the one
+        staff shape known to render on this client, with this tree's own
+        conventions layered on (`rareflag` + `rareFlag`, `cardassetid`,
+        `tradeable`). Physios and fitness coaches carry their boost in
+        `attributeList` and the `Attribute1..6` / `statBonus` / `bonus` /
+        `posMods` / `position` / `gkPositioning` members; coaches and managers do
+        not, exactly as Impulsum serves them. Catalogue-only fields (`cat`,
+        `value`, `carddbid`, `talkrating`, `negotiation`, `formationid`,
+        `attribute`, `posbonus`, `fieldpos`) never reach the wire.
+        """
+        item_type = str(card.get("itemType", "manager"))
+        resource = int(card.get("resourceId", 0) or 0)
+        rating = int(card.get("value", 0) or 0)
+        rare = 1 if int(card.get("rare", 0) or 0) > 0 else 0
+        amount = int(card.get("amount", 0) or 0)
+        attribute = int(card.get("attribute", 0) or 0)
+        boost = item_type in {"physio", "fitnessCoach"}
+        attribute_list: list[dict[str, int]] = []
+        if boost:
+            slot = attribute if item_type == "physio" else 0
+            attribute_list = [{"value": amount if index == slot else 0, "index": index} for index in range(7)]
+        payload: dict[str, Any] = {
+            "id": int(item_id), "itemId": int(item_id), "timestamp": int(time.time()),
+            "formation": "f442", "untradeable": False, "tradeable": True,
+            "assetId": resource, "resourceId": resource, "cardassetid": resource,
+            "rating": rating, "itemType": item_type, "owners": 1,
+            "discardValue": max(1, rating * 4), "itemState": str(item_state),
+            "cardsubtypeid": STAFF_CARD_SUBTYPES.get(item_type, 4),
+            "lastSalePrice": 0, "morale": 0, "fitness": 0,
+            "injuryType": "none", "injuryGames": 0, "preferredPosition": "",
+            "statsList": [], "lifetimeStats": [], "training": 0,
+            "contract": 7, "suspension": 0,
+            "attributeList": attribute_list, "teamid": 0,
+            "rareflag": rare, "rareFlag": rare, "playStyle": 0,
+            "leagueId": 0, "leagueid": 0, "assists": 0, "lifetimeAssists": 0,
+            "pile": int(pile),
+            "nation": int(card.get("nation", 0) or 0), "nationid": int(card.get("nation", 0) or 0),
+            "resourceGameYear": 2014, "amount": amount if boost else 0,
+        }
+        if item_type == "physio":
+            slots = [0] * 6
+            if 0 <= attribute < 6:
+                slots[attribute] = amount
+            payload.update({f"Attribute{index + 1}": slots[index] for index in range(6)})
+            payload.update({"statBonus": amount, "bonus": amount})
+        elif item_type == "fitnessCoach":
+            posbonus = int(card.get("posbonus", 0) or 0)
+            fieldpos = int(card.get("fieldpos", 0) or 0)
+            payload.update({"statBonus": amount, "bonus": posbonus, "posMods": posbonus,
+                            "position": fieldpos, "gkPositioning": fieldpos})
+        return payload
+
     @staticmethod
     def _consumable_filter_category(definition: dict[str, Any]) -> str:
         category = str(definition.get("category", "")).strip()
@@ -3049,12 +3176,19 @@ class LocalIdentityStore:
         quality = str(definition.get("minQuality", "gold")).lower()
         promo = not bool(definition.get("regular", True))
         player_slots = max(0, min(count, int(definition.get("playerSlots", count))))
+        # Staff slots (Impulsum14's pack wildcard, narrowed to what this club does
+        # not already own): `managerSlots` draws managers, `staffSlots` coaches and
+        # physios. Both come out of the consumable share, never the player share,
+        # so the advertised player count holds.
+        manager_slots = max(0, min(count - player_slots, int(definition.get("managerSlots", 0) or 0)))
+        staff_slots = max(0, min(count - player_slots - manager_slots, int(definition.get("staffSlots", 0) or 0)))
         seed = f"{PACK_WEIGHTS_DOCUMENT.get('seed','FIFA14')}:{pack_id}:{definition.get('packType')}"
         rng = random.Random(seed)
 
         # Rares apply to the entire pack, not just the player positions.
         rare_indices = set(rng.sample(range(count), k=rare_count)) if rare_count else set()
-        slot_kinds = ["player"] * player_slots + ["consumable"] * (count - player_slots)
+        slot_kinds = (["player"] * player_slots + ["manager"] * manager_slots + ["staff"] * staff_slots
+                      + ["consumable"] * (count - player_slots - manager_slots - staff_slots))
         rng.shuffle(slot_kinds)
 
         used_assets: set[int] = set()
@@ -3168,6 +3302,14 @@ class LocalIdentityStore:
                 if int(player.get("rating", 0)) >= 90:
                     elite_count += 1
                 payload = self._local_pack_player_payload(item_id=item_id, player=player, quality=quality, rare=rare)
+            elif kind in {"manager", "staff"}:
+                card = self._weighted_staff(rng, quality=quality, kind=kind, rare_slot=rare,
+                                            excluded_resources=used_resources)
+                used_resources.add(int(card.get("resourceId", 0) or 0))
+                payload = self._local_staff_payload(item_id=item_id, card=card, pile=6)
+                # The pack advertises its rare count; the slot decides, as it does
+                # for consumables (and as Impulsum14 stamps its pack managers).
+                payload["rareflag"] = payload["rareFlag"] = 1 if rare else 0
             else:
                 consumable = self._weighted_consumable(rng, quality=quality, rare_slot=rare)
                 payload = self._local_consumable_payload(item_id=item_id, consumable=consumable)
@@ -4226,6 +4368,13 @@ class LocalIdentityStore:
             nonplayer_type = requested_type if requested_type in {
                 "development", "training", "kit", "stadium", "custom", "ball", "trophy"
             } else None
+            # The staff tab: `type=manager|staff|headcoach|gkcoach|physio|fitnesscoach`
+            # (the vocabulary Impulsum14 accepts), optionally narrowed by `cat`.
+            staff_kinds = _staff_kinds_for_token(requested_type) if requested_type not in {"", "1"} else None
+            raw_staff_category = first("cat", first("category", "")).strip()
+            if staff_kinds is not None and raw_staff_category:
+                narrowed = _staff_kinds_for_token(raw_staff_category)
+                staff_kinds = None if narrowed is None else tuple(kind for kind in staff_kinds if kind in narrowed)
 
             if player_request:
                 rows = connection.execute(
@@ -4278,6 +4427,27 @@ class LocalIdentityStore:
                         if resource_id not in CONSUMABLE_BY_RESOURCE:
                             continue
                         preload_consumables.append(consumable)
+            elif staff_kinds is not None:
+                placeholders = ",".join("?" for _ in staff_kinds) or "''"
+                rows = connection.execute(
+                    f"SELECT payload FROM items WHERE persona_id = ? AND item_type IN ({placeholders}) "
+                    f"AND pile NOT IN ('trade','pending') ORDER BY item_id",
+                    (persona_id, *staff_kinds),
+                ).fetchall()
+                for row in rows:
+                    try:
+                        payload = json.loads(row["payload"] or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        continue
+                    if not isinstance(payload, dict):
+                        continue
+                    payload["pile"] = 7
+                    rating = int(payload.get("rating", 0) or 0)
+                    if level_key not in {"", "any", "-1"} and level_key != self._quality_for_rating(rating):
+                        continue
+                    if nation >= 0 and int(payload.get("nation", -1) or -1) != nation:
+                        continue
+                    documents.append(payload)
             elif consumable_request or equippable_request or nonplayer_type is not None:
                 if consumable_request:
                     rows = connection.execute(
@@ -4672,8 +4842,6 @@ class LocalIdentityStore:
                         "(1,173 kits / 587 badges / 61 stadiums), so there is nothing left to sell it",
             "stadium": "the club already owns all 61 shipped stadiums",
             "ball": "no ball rows have been extracted from the client databases yet",
-            "staff": "manager-catalog.v237.json is reference metadata with liveEmissionEnabled=false; "
-                     "its resource IDs are unverified against this build and emitting them risks BUG-004 DB ERROR cards",
         }
         reason = reasons.get(str(requested_type).casefold(), "this build lists only players and consumables")
         _diagnostic(
@@ -4686,6 +4854,8 @@ class LocalIdentityStore:
         requested_type = self._market_first(query, "type", default="player").lower()
         if requested_type in MARKET_CONSUMABLE_TYPES:
             return self._market_search_consumables(query, requested_type)
+        if requested_type in MARKET_STAFF_TYPES:
+            return self._market_search_staff(query)
         if requested_type not in {"", "player", "1"}:
             self._market_unstocked_family(requested_type, self._market_first(query, "cat", "category", default=""))
             return self.empty_auctions()
@@ -4920,6 +5090,10 @@ class LocalIdentityStore:
                 if consumable is not None:
                     auctions.append(self._market_consumable_auction(consumable[0], consumable[1], now=now))
                     continue
+                staff_card = self._market_staff_from_trade_id(trade_id)
+                if staff_card is not None:
+                    auctions.append(self._market_staff_auction(staff_card, now=now))
+                    continue
                 decoded = self._market_from_trade_id(trade_id)
                 if decoded is not None and trade_id not in recent_sold:
                     player, copy_index = decoded
@@ -4996,12 +5170,144 @@ class LocalIdentityStore:
                         "credits": coins, "totalCredits": coins, "coins": coins})
         return listing
 
+    # ------------------------------------------------------------------ staff
+    # Staff ride the consumable rails (handoff §7.2): always stocked, one copy of
+    # each card, a flat price by rating, no rotation and no sell-out. Each card's
+    # trade id is its catalogue index above a base of its own so market_status and
+    # market_bid can tell the families apart without a lookup table.
+
+    @staticmethod
+    def _market_staff_trade_id(card: dict[str, Any]) -> int:
+        return MARKET_STAFF_TRADE_ID_BASE + MARKET_STAFF_INDEX[int(card.get("resourceId", 0) or 0)]
+
+    @staticmethod
+    def _market_staff_from_trade_id(trade_id: int) -> dict[str, Any] | None:
+        offset = int(trade_id) - MARKET_STAFF_TRADE_ID_BASE
+        if offset < 0 or offset >= len(STAFF_CATALOG):
+            return None
+        return STAFF_CATALOG[offset]
+
+    def _market_staff_auction(self, card: dict[str, Any], *, now: int) -> dict[str, Any]:
+        index = MARKET_STAFF_INDEX[int(card.get("resourceId", 0) or 0)]
+        item = self._local_staff_payload(item_id=MARKET_STAFF_ITEM_ID_BASE + index, card=card, pile=0,
+                                         item_state="free")
+        price = _staff_price(card)
+        return {
+            "tradeId": self._market_staff_trade_id(card),
+            "tradeState": "active",
+            "expires": 3600, "EXPIRE_TIME": 3600, "expireTime": 3600,
+            "startTime": 0, "endtime": 2147483647,
+            "buyNowPrice": price, "startingBid": price,
+            "currentBid": 0, "offers": 0, "watched": False, "bidState": "none",
+            "tradeOwner": False, "sellerName": "FUT", "sellerEstablished": 2013,
+            "sellerId": 1 + (int(card.get("resourceId", 0) or 0) % 999999), "confidenceValue": 100,
+            "itemData": item,
+        }
+
+    def _market_search_staff(self, query: dict[str, Any]) -> dict[str, Any]:
+        """Managers, head coaches, GK coaches, fitness coaches and physios.
+
+        The tab sends `type=staff&cat=<family>` (2026-08-16 capture) and the
+        manager sub-tab adds `nat=`. An unknown `cat` stays empty rather than
+        falling back to every family, the same rule the consumable search keeps.
+        """
+        raw_category = self._market_first(query, "cat", "category", default="").strip()
+        kinds = _staff_kinds_for_token(raw_category)
+        if kinds is None:
+            return self.empty_auctions()
+        level = self._market_first(query, "lev", "level", default="any").lower()
+        level = {"1": "bronze", "2": "silver", "3": "gold"}.get(level, level)
+        nation = self._market_int(query, "nat", "nation", default=-1)
+        min_buy = self._market_int(query, "micr", "minBuyNow", default=0) or 0
+        max_buy = self._market_int(query, "macr", "maxBuyNow", default=0) or 0
+        start = max(0, self._market_int(query, "start", "offset", "skip", default=0) or 0)
+        count = max(1, min(100, self._market_int(query, "num", "count", default=20) or 20))
+        now = int(time.time())
+
+        with self._lock, closing(self._connect()) as connection:
+            identity = self._identity(connection)
+            club = connection.execute(
+                "SELECT coins FROM clubs WHERE persona_id=?", (int(identity["persona_id"]),)
+            ).fetchone()
+            coins = int(club["coins"]) if club is not None else 0
+
+        wanted = set(kinds)
+        refs: list[dict[str, Any]] = []
+        for card in STAFF_CATALOG:
+            if str(card.get("itemType", "")) not in wanted:
+                continue
+            rating = int(card.get("value", 0) or 0)
+            if level in {"bronze", "silver", "gold"} and self._quality_for_rating(rating) != level:
+                continue
+            if nation not in (None, -1, 0) and int(card.get("nation", -999) or -999) != int(nation):
+                continue
+            price = _staff_price(card)
+            if (min_buy and price < min_buy) or (max_buy and price > max_buy):
+                continue
+            refs.append(card)
+        # Family order as the tab lists it, best card first inside a family, and
+        # a fixed tie-break so paging cannot reshuffle underneath the client.
+        family_rank = {kind: index for index, kind in enumerate(STAFF_ITEM_TYPES)}
+        refs.sort(key=lambda card: (
+            family_rank.get(str(card.get("itemType", "")), 99),
+            -int(card.get("value", 0) or 0), -int(card.get("rare", 0) or 0),
+            int(card.get("resourceId", 0) or 0),
+        ))
+        page = refs[start:start + count]
+        auctions = [self._market_staff_auction(card, now=now) for card in page]
+        return {"auctionInfo": auctions, "duplicateItemIdList": [], "total": len(refs),
+                "credits": coins, "totalCredits": coins, "coins": coins}
+
+    def _market_bid_staff(self, trade_id: int, amount: int, card: dict[str, Any]) -> dict[str, Any]:
+        """Buy one staff card at its flat price; the item lands in New Items."""
+        now = int(time.time())
+        price = _staff_price(card)
+        resource = int(card.get("resourceId", 0) or 0)
+        item_type = str(card.get("itemType", "manager"))
+        with self._lock, closing(self._connect()) as connection, connection:
+            identity = self._identity(connection)
+            persona_id = int(identity["persona_id"])
+            club = connection.execute("SELECT coins FROM clubs WHERE persona_id=?", (persona_id,)).fetchone()
+            coins = int(club["coins"]) if club is not None else 0
+            if amount <= 0:
+                amount = price
+            if amount < price:
+                listing = self._market_staff_auction(card, now=now)
+                listing.update({"currentBid": amount, "offers": 1, "bidState": "outbid",
+                                "credits": coins, "totalCredits": coins, "coins": coins})
+                return listing
+            if price > coins:
+                return {"reason": "INSUFFICIENT_COINS", "tradeId": int(trade_id),
+                        "credits": coins, "totalCredits": coins, "coins": coins}
+            connection.execute("UPDATE clubs SET coins=coins-? WHERE persona_id=?", (price, persona_id))
+            next_id = int(connection.execute(
+                "SELECT COALESCE(MAX(item_id), ?) + 1 FROM items WHERE persona_id=?",
+                (PACK_ITEM_BASE, persona_id),
+            ).fetchone()[0])
+            payload = self._local_staff_payload(item_id=next_id, card=card, pile=6, item_state="new")
+            payload["lastSalePrice"] = price
+            connection.execute(
+                "INSERT INTO items(item_id,persona_id,asset_id,item_type,pile,tradeable,payload) "
+                "VALUES (?,?,?,?,'pending',1,?)",
+                (next_id, persona_id, resource, item_type,
+                 json.dumps(payload, separators=(",", ":"), ensure_ascii=False)),
+            )
+            coins -= price
+        listing = self._market_staff_auction(card, now=now)
+        listing.update({"currentBid": amount, "offers": 0, "bidState": "highest",
+                        "tradeState": "closed", "itemData": payload,
+                        "credits": coins, "totalCredits": coins, "coins": coins})
+        return listing
+
     def market_bid(self, trade_id: int, amount: int) -> dict[str, Any]:
         trade_id = int(trade_id)
         amount = max(0, int(amount))
         consumable = self._market_consumable_from_trade_id(trade_id)
         if consumable is not None:
             return self._market_bid_consumable(trade_id, amount, consumable[0], consumable[1])
+        staff_card = self._market_staff_from_trade_id(trade_id)
+        if staff_card is not None:
+            return self._market_bid_staff(trade_id, amount, staff_card)
         decoded = self._market_from_trade_id(trade_id)
         if decoded is None:
             return {"reason": "INVALID_REQUEST", "tradeId": trade_id}
@@ -5748,4 +6054,5 @@ class LocalIdentityStore:
                 ).fetchone()[0]),
                 "managerReferenceCount": len(MANAGER_CATALOG_DOCUMENT.get("managers", [])),
                 "managerLiveEmission": bool(MANAGER_CATALOG_DOCUMENT.get("liveEmissionEnabled", False)),
+                "staffCatalogCount": len(STAFF_CATALOG),
             }

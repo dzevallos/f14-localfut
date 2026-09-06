@@ -5,6 +5,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import time
 from contextlib import closing
 from pathlib import Path
 
@@ -308,8 +309,18 @@ def main() -> int:
         if int(first.get("trophyResourceId", 0)) != -1:
             fail(f"BETA 2.22 season no-trophy sentinel must be -1: {first}")
         matches = first.get("matches")
-        if int(first["numMatches"]) != 10 or int(first["matchLengthMin"]) != 6 or not isinstance(matches, list) or len(matches) != 10:
+        if int(first["numMatches"]) != 10 or not isinstance(matches, list) or len(matches) != 10:
             fail(f"Division 10 native match contract is wrong: {first}")
+        # matchLengthMin is user-configurable (BETA 2.26.6), so assert the
+        # invariant, not the shipped 6. Pinning the number here is what stopped
+        # the game booting the first time someone actually used the new setting:
+        # a verifier failure presents as "the game will not start", with no
+        # message, and the elevated launcher window closes before it can be read.
+        served_length = int(first["matchLengthMin"])
+        if not 1 <= served_length <= 11:
+            fail(f"matchLengthMin must stay within the client's 1..11 range: {first}")
+        if served_length != beta_identity_module._match_length_min():
+            fail(f"the season list must serve the configured half length, got {served_length}")
         required_match = {"teamId", "difficulty", "rewardMult", "roundId", "coins"}
         if any(not required_match.issubset(match) for match in matches):
             fail(f"Division 10 native match record is incomplete: {matches}")
@@ -414,15 +425,129 @@ def main() -> int:
             1, store.entry_season_division(),
             {"round": 2, "dataVersion": 1, "data": mid_season, "progressDataVersion": 1, "progressData": "AwAAAAsIAA=="},
         )
-        if list(saved) != ["round", "dataVersion", "data", "progressDataVersion", "progressData"]:
+        if list(saved) != ["round", "dataVersion", "data", "progressDataVersion", "progressdata"]:
             fail(f"a season save must be echoed in the client's own write order: {saved}")
         resumed = store.offline_season_user()
         if int(resumed["round"]) != 2 or resumed.get("data") != mid_season:
             fail(f"a saved season must come back underway at the round it saved: {resumed}")
         if list(resumed).index("data") > list(resumed).index("dataVersion"):
             fail(f"dataVersion decodes the buffer before it, so data must come first: {list(resumed)}")
-        if int(resumed["divisionId"]) > 10:
-            fail(f"a saved season must still report a division the client recognises: {resumed}")
+        # The progress buffer goes out as "progressdata", all lowercase. CardsDLL's
+        # key mapper resolved the camelCase "progressData" to id 614 in the
+        # 2026-08-20 capture -- the id every unknown key gets -- while
+        # "progressDataVersion" resolved to 396, and the DLL's string table has an
+        # exact "progressdata" and no "progressData". The client PUTs camelCase and
+        # reads lowercase, so the server must accept either and emit lowercase.
+        for name, doc in (("season/user", resumed), ("season save echo", saved)):
+            if "progressData" in doc:
+                fail(f"{name} must not carry the camelCase progressData key the client cannot resolve: {list(doc)}")
+            if doc.get("progressdata") != "AwAAAAsIAA==":
+                fail(f"{name} must carry the client's progress buffer under 'progressdata': {doc}")
+        # The served document obeys buffer-before-version; the echo keeps the
+        # client's own write order, which is pinned above.
+        if list(resumed).index("progressdata") > list(resumed).index("progressDataVersion"):
+            fail(f"progressDataVersion decodes the buffer before it, so progressdata must come first: {list(resumed)}")
+        lowercase_write = store.update_offline_season_user(
+            1, store.entry_season_division(),
+            {"round": 2, "dataVersion": 1, "data": mid_season, "progressDataVersion": 1, "progressdata": "AwAAAAsIAA=="},
+        )
+        if lowercase_write.get("progressdata") != "AwAAAAsIAA==":
+            fail(f"a lowercase progressdata write must be accepted too: {lowercase_write}")
+        # BETA 2.26.2. This used to read `divisionId > 10 -> fail` for every
+        # document. That generalised one recorded observation past what it says:
+        # §5's "1 / 11 -> access violation at CardsDLLzf+0xc66dd" is written down
+        # as happening *when the data buffer was empty*, and the case built above
+        # is a non-empty 18-player save. The extrapolation had a cost -- an
+        # unplaced client derives its tier as `11 - divisionId` and compares it
+        # with its own 0, so a reported 10 never matched and no season ever
+        # resumed (2026-08-17 04:15: served round 2 with a real save, client wrote
+        # back round 1 and the stub). Encode the constraint that was actually
+        # observed instead, which is stricter where the crash was:
+        #
+        #   a document with no resumable buffer must never carry the alias;
+        #   a resumable one may, but only while the club is unplaced.
+        if "data" not in opened and int(opened["divisionId"]) > 10:
+            fail(f"a document with no resumable save must never report the unplaced alias: {opened}")
+        if int(opened["seasonId"]) != -1:
+            fail(f"a document with no resumable save must use the -1 fresh sentinel: {opened}")
+        if int(resumed["divisionId"]) != 11:
+            fail(
+                "an unplaced club's resumable season must report the division the client "
+                f"uses for itself so `11 - divisionId` matches its own tier index 0: {resumed}"
+            )
+        if int(resumed["seasonId"]) != 1:
+            fail(f"seasonId must still name the season-list record carrying that division: {resumed}")
+        # BETA 2.26.18. The alias must not depend on the club having no history.
+        # It used to, and the first completed season silently turned the resume
+        # back off (2026-08-18 22:09: history row written, season/user reverted
+        # to divisionId 10, client restarted at round 1). The client keeps
+        # addressing /division/11/ after finishing a season, so finishing one
+        # must change nothing here.
+        with closing(store._connect()) as _conn:  # noqa: SLF001 - verifier reaches in deliberately
+            _conn.execute(
+                "INSERT INTO beta_season_history (persona_id,finished_at,season_id,division,"
+                "next_division,matches_played,points,won,draw,lost,outcome,coins) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (1000001, 0, 1, 10, 10, 10, 0, 0, 0, 10, "RELEGATION", 0),
+            )
+            _conn.commit()
+        after_history = store.offline_season_user()
+        with closing(store._connect()) as _conn:  # noqa: SLF001 - put the row back
+            _conn.execute("DELETE FROM beta_season_history WHERE persona_id=? AND finished_at=0", (1000001,))
+            _conn.commit()
+        if int(after_history["divisionId"]) != 11 or int(after_history["seasonId"]) != 1:
+            fail(
+                "a completed season must not turn the unplaced alias off -- the client still "
+                f"addresses /division/11/ after one: {after_history}"
+            )
+        # BETA 2.26.3. A resuming season writes nothing before kickoff, so the
+        # season/user *read* is what marks a following match as a season fixture.
+        # Without this stamp the tally silently becomes a race against the
+        # previous match's save and drops fixtures (2026-08-17 04:30: 2 of 4
+        # counted, server on 3 while the client had reached round 5).
+        seen_at = float(getattr(store, "_season_screen_seen_at", 0.0) or 0.0)
+        if time.time() - seen_at > 60:
+            fail(
+                "reading season/user must stamp when the Seasons screen was seen, "
+                f"or season fixtures stop being counted: _season_screen_seen_at={seen_at}"
+            )
+        # BETA 2.26.22 (Impulsum14's Seasons.SaveProgress rule): the client owns
+        # the fixture list, so the round it saves says how many fixtures are really
+        # behind it. The 2026-08-17 04:30 capture left the server one fixture
+        # short (§7.1b); the next save now closes that gap, counting what was
+        # missed as losses, and trims a tally that ran ahead.
+        with closing(sqlite3.connect(db)) as tally_con, tally_con:
+            tally_con.execute(
+                "UPDATE beta_season_progress SET matches_played=1,points=3,won=1,draw=0,lost=0 "
+                "WHERE persona_id=1000001"
+            )
+        store.update_offline_season_user(
+            1, store.entry_season_division(),
+            {"round": 4, "dataVersion": 1, "data": mid_season, "progressDataVersion": 1, "progressData": "AwAAAAsIAA=="},
+        )
+        with closing(sqlite3.connect(db)) as tally_con:
+            behind = tally_con.execute(
+                "SELECT matches_played,points,won,lost FROM beta_season_progress WHERE persona_id=1000001"
+            ).fetchone()
+        if tuple(behind) != (3, 3, 1, 2):
+            fail(f"a save two fixtures ahead of the tally must close the gap with losses: {behind}")
+        store.update_offline_season_user(
+            1, store.entry_season_division(),
+            {"round": 3, "dataVersion": 1, "data": mid_season, "progressDataVersion": 1, "progressData": "AwAAAAsIAA=="},
+        )
+        with closing(sqlite3.connect(db)) as tally_con:
+            ahead = tally_con.execute(
+                "SELECT matches_played,points,won,lost FROM beta_season_progress WHERE persona_id=1000001"
+            ).fetchone()
+        if tuple(ahead) != (2, 3, 1, 1):
+            fail(f"a tally that ran ahead of the client must be trimmed to its round: {ahead}")
+        if int(store.offline_season_user()["round"]) != 3:
+            fail("reconciling the tally must not move the saved round")
+        # Put the season back where the assertions below expect it (round 2).
+        store.update_offline_season_user(
+            1, store.entry_season_division(),
+            {"round": 2, "dataVersion": 1, "data": mid_season, "progressDataVersion": 1, "progressData": "AwAAAAsIAA=="},
+        )
         # A save for a division the club is not in belongs to a finished season.
         before_stale = store.offline_season_user()
         stale = store.update_offline_season_user(9, 3, {"round": 7, "dataVersion": 1, "data": "Wlpa"})
@@ -803,7 +928,7 @@ def main() -> int:
         cup2_after_dnf = store.offline_tournament_user(2)
         if (int(cup2_after_dnf.get("round", 0)) != 2 or
                 cup2_after_dnf.get("tournamentData") != "cup-two-data" or
-                cup2_after_dnf.get("progressData") != "AQAAAA=="):
+                cup2_after_dnf.get("progressdata") != "AQAAAA=="):
             fail(f"DNF in cup 1 incorrectly destroyed cup 2 progress: {cup2_after_dnf}")
 
         store.reset_match({"matchId": "verify-match", "mode": "single-player", "difficulty": "Professional"})
@@ -1088,6 +1213,19 @@ def main() -> int:
                 fail(f"a non-numeric payout must be dropped, not coerced: {loaded}")
             if loaded.get("market", {}).get("rotationFraction") != 64:
                 fail(f"an absurd rotation fraction must clamp: {loaded}")
+            # BETA 2.26.6. Half length reaches gameplay through the competition
+            # record CardsDLL builds from this JSON (HALF_LENGTH, 0x100d088d), so
+            # the *setting* has to be exercised, not just the shipped 6.
+            settings_file.write_text('{"matchLengthMin": 2}', encoding="utf-8")
+            fut_local_settings.load_settings(refresh=True)
+            if int(beta_identity_module._native_season_record(1, 10, 10, 9, 1900)["matchLengthMin"]) != 2:
+                fail("a configured matchLengthMin must reach the season list")
+            for bad in ('{"matchLengthMin": 0}', '{"matchLengthMin": 45}', '{"matchLengthMin": "abc"}'):
+                settings_file.write_text(bad, encoding="utf-8")
+                fut_local_settings.load_settings(refresh=True)
+                served = int(beta_identity_module._native_season_record(1, 10, 10, 9, 1900)["matchLengthMin"])
+                if served != beta_identity_module.DEFAULT_MATCH_LENGTH_MIN:
+                    fail(f"an out-of-range matchLengthMin must fall back to the default, {bad} gave {served}")
             settings_file.write_text("{ not json at all", encoding="utf-8")
             if fut_local_settings.load_settings(refresh=True) != {}:
                 fail("a malformed settings file must be ignored, not partially applied")

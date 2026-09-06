@@ -1,3 +1,5 @@
+param([switch]$Elevated)
+
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 $projectDir = Split-Path -Parent $PSScriptRoot
@@ -24,10 +26,62 @@ function Test-IsAdministrator {
 
 if (-not (Test-IsAdministrator)) {
     Write-Host "Administrator rights are required for the local hosts/certificate setup and FIFA archive patching. Requesting elevation..."
-    Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList @(
-        "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ('"' + $PSCommandPath + '"')
-    ) | Out-Null
+    # -Wait and the child's exit code matter: without them this returned 0 the
+    # instant the elevated window opened, so a failure over there closed its own
+    # window and the caller's `pause` reported success. That is why a failing
+    # verifier presented as "the window flashed and nothing happened".
+    try {
+        $elevatedProcess = Start-Process -FilePath "powershell.exe" -Verb RunAs -PassThru -Wait -ArgumentList @(
+            "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ('"' + $PSCommandPath + '"'), "-Elevated"
+        )
+    } catch {
+        Write-Host ""
+        Write-Host "Elevation was refused or failed: $($_.Exception.Message)" -ForegroundColor Red
+        exit 1
+    }
+    if ($null -ne $elevatedProcess -and $elevatedProcess.ExitCode -ne 0) { exit $elevatedProcess.ExitCode }
     exit 0
+}
+
+# ---------------------------------------------------------------------------
+# From here on this process does the work, so everything it prints is worth
+# keeping. Transcribe to artifacts\launcher.log and never let the window close
+# on an unread error.
+# ---------------------------------------------------------------------------
+$launcherLogDir = Join-Path $projectDir "artifacts"
+$launcherLog = Join-Path $launcherLogDir "launcher.log"
+$launcherTranscribing = $false
+try {
+    New-Item -ItemType Directory -Force -Path $launcherLogDir | Out-Null
+    Start-Transcript -Path $launcherLog -Force | Out-Null
+    $launcherTranscribing = $true
+} catch {
+    Write-Host "(could not start the launcher transcript: $($_.Exception.Message))" -ForegroundColor Yellow
+}
+
+function Stop-LauncherTranscript {
+    if ($script:launcherTranscribing) {
+        try { Stop-Transcript | Out-Null } catch { }
+        $script:launcherTranscribing = $false
+    }
+}
+
+trap {
+    Stop-LauncherTranscript
+    Write-Host ""
+    Write-Host "==================== LAUNCH FAILED ====================" -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    if ($null -ne $_.InvocationInfo) {
+        Write-Host $_.InvocationInfo.PositionMessage -ForegroundColor DarkGray
+    }
+    Write-Host ""
+    Write-Host "Full log, including any verifier output above: $launcherLog" -ForegroundColor Yellow
+    Write-Host "Send that file if you want it looked at." -ForegroundColor Yellow
+    Write-Host "=======================================================" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "Press Enter to close this window..."
+    try { [void](Read-Host) } catch { Start-Sleep -Seconds 60 }
+    exit 1
 }
 
 Write-Host "============================================================"
@@ -88,4 +142,12 @@ if (-not (Test-Path -LiteralPath $venvPython)) {
 }
 
 & (Join-Path $PSScriptRoot "run_fifa14_local_beta.ps1") -GameRoot $GameRoot -GameExe $GameExe
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$sessionExitCode = $LASTEXITCODE
+Stop-LauncherTranscript
+if ($sessionExitCode -ne 0) {
+    Write-Host ""
+    Write-Host "The session exited with code $sessionExitCode. Full log: $launcherLog" -ForegroundColor Yellow
+    Write-Host "Press Enter to close this window..."
+    try { [void](Read-Host) } catch { Start-Sleep -Seconds 60 }
+    exit $sessionExitCode
+}

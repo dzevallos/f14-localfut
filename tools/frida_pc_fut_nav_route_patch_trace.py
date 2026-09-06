@@ -109,6 +109,714 @@ const MATCH_ENTITY_TABLE_TARGET = {
   arrayOffset: 0x34,
   entryCount: 22
 };
+// BETA 2.26.2 diagnostic: name the moment the client gives up on its own session.
+//
+// The 2026-08-17 00:26 forfeit capture shows the decision but not the reason. The
+// server answered every request 200, the post-match Blaze re-init began exactly as
+// it does after a completed match and then stopped dead after OSDK_TICKER -- no
+// OSDK_ABUSE_REPORTING, no OSDK_ARENA, no OSDK_ROSTER, none of the 2249/* pair --
+// and 2.6 s later NAV asked for fcc_logout. Nothing in the traffic says why.
+//
+// CardsDLLzf raises the answer as a UI event through one dispatcher,
+// [vtable+0x40] with the event name as its only argument. Four names share that
+// dispatcher and they are the whole decision:
+//
+//   EnterPostGame              the healthy return -- a match finished
+//   FUTServerErrorInGameplay   the server was blamed
+//   FUTOnlineDisconnect        the session was declared lost  <- the popup
+//   FUTOnlinePeerDisconnect    the opponent's side dropped
+//
+// Every push site of all four is hooked, so the next capture reports which one
+// fired, from where, and how it sits against the fcc_logout nav. Purely
+// observational, and these fire a handful of times per session at most.
+//
+// The site is `push <event string>; ...`, and that operand is **relocated** --
+// CardsDLLzf does not load at its preferred 0x10000000 (0x37ea0000 in the
+// 2026-08-17 01:39 capture). The first attempt at this table pinned the operand
+// as the file's own bytes and all nine signatures missed by two bytes, so the
+// hooks silently installed zero of nine and the capture said nothing. Verify the
+// push opcode, the operand rebased onto this module, and the fixed tail after
+// it; `stringRva` doubles as the check that the site really pushes that name.
+//
+// BETA 2.26.2, second pass: **attaching is off by default and should stay off.**
+// The one run with all nine armed (2026-08-17 03:50) answered the question -- a
+// forfeit raises FUTOnlineDisconnect from rva 0x9a418 -- and then FIFA died 6 ms
+// later inside the handler that event dispatches into (fifa14.exe+0x2e29b0,
+// reading 0xcdcdcdcd through ECX). Frames #2..#15 of the crash are identical to
+// frames #2..#15 of the hook record, so the fault is in the callee on a stack
+// that was intact at the push; and 0xcdcdcd** faults predate this hook entirely
+// (five 2026-08-13 dumps at eip 0x01700840 reading 0xcdcdcded). That points at
+// the client. But the immediately preceding run on the same build walked this
+// path without crashing, so a mid-function hook on a tearing-down dispatch
+// cannot be *excluded* either -- and the answer is already banked. Keep
+// verifying the signatures every run so the table cannot rot silently; set this
+// true only to re-open the question deliberately.
+// BETA 2.26.7: what the client actually pushes into the gameplay parameters.
+//
+// `matchLengthMin: 2` was served, the client parsed it (key id 293), and the
+// halves did not get shorter (2026-08-18 20:21 capture). So `[record+0x50]`,
+// which CardsDLL pushes as HALF_LENGTH at 0xd088d, is not fed by our field --
+// or is overwritten later. Read the value at the push and print it.
+//
+// AI_GROUP (0xd08ab, from `[record+0x5c]`) is hooked as the control: that one we
+// *do* drive from our own JSON through TOURNAMENT_TEAM_POOLS/aigroup. If AI_GROUP
+// shows our value in the same block where HALF_LENGTH shows something else, the
+// record is definitely ours and simply does not carry our length -- which points
+// at the field, not at the plumbing. If neither matches, the record is not the
+// one built from our documents at all.
+//
+// Both read the value out of EAX, which the two instructions above the push have
+// just loaded (or zeroed / set to -1 on the null-record branch). Observational
+// only: no writes, no backtrace, one emit per match setup.
+// BETA 2.26.8: runtime xref scan for the half-length strings in fifa14.exe.
+//
+// Static analysis of fifa14.exe cannot answer this. Its .text has vsize
+// 0x3829000 (56 MB) against rawsize 0x1749a00 (23 MB) -- the image is packed and
+// most of the code only exists once it is running, which is why all eight
+// half-length strings have zero xrefs in the file on disk. .rdata *is* intact on
+// disk, so the string RVAs below are trustworthy; only the referencing code is
+// missing. Do the xref at runtime instead, where .text is decompressed.
+//
+// One shot, read-only: scan .text for the 4-byte little-endian address of each
+// string and emit each hit with a window of bytes around it, which is enough to
+// disassemble offline and find the FUT-side gate. Scanning 56 MB for eight
+// 4-byte patterns is a second or two, done once at attach, nowhere near a
+// gameplay transition (rule 4).
+const HALF_LENGTH_XREF_SCAN_ENABLED = true;
+const HALF_LENGTH_STRING_RVAS = [
+  {name:'DB_HALFLENGTH',             rva:0x38a9b20},
+  {name:'GameSettingHalfLength',     rva:0x3923680},
+  {name:'HALF_LENGTH',               rva:0x38cf848},
+  {name:'CJUICE_SETTING_HALFLENGTH', rva:0x38c777b},
+  {name:'halflength',                rva:0x38c157c},
+  {name:'halfLengthOptions',         rva:0x3923698},
+  {name:'HALF_LENGTH_OPTIONS',       rva:0x391b3b4},
+  {name:'ONL_HALF_LENGTH',           rva:0x382e540}
+];
+const HALF_LENGTH_TEXT_RVA = 0x1000;
+const HALF_LENGTH_TEXT_SIZE = 0x3829000;
+const HALF_LENGTH_MAX_HITS_PER_STRING = 24;
+// Watch the HALF_LENGTH sites execute and report the registers at each one.
+const HALF_LENGTH_VALUE_HOOKS_ENABLED = true;
+// BETA 2.26.11: the field registry.
+//
+// No site that references the string "HALF_LENGTH" runs during a FUT match, in
+// either binary -- because both `DB_HALFLENGTH` (0x42a204) and `halflength`
+// (0x9b18ff) *register* half length as field index 5, after which it is
+// addressed by index and the name is never touched again. So follow the
+// registration instead of the name.
+//
+// The registration site has a fixed shape, verified against the 2026-08-18 20:53
+// byte window:
+//
+//   push offset "halflength"   <- the scan hit lands on this operand
+//   push 5                     6a 05
+//   mov  ecx, esi              8b ce
+//   call <registry>            e8 <rel32>     -> RVA 0x18571a0
+//
+// Derive the call target from those bytes at runtime rather than hardcoding it,
+// validating the opcodes first, then hook the registry. That is a *function
+// entry*, not a mid-function push site, so it is far safer than the four
+// HALF_LENGTH watchers. Logging every (index, name) pair recovers the whole
+// field table and, more importantly, the registry object in ECX -- which is what
+// a later pass needs in order to read or override field 5.
+// BETA 2.26.12: dump code windows so the packed binary can be disassembled.
+//
+// fifa14.exe is packed, so nothing here can be read offline from the file. These
+// windows are copied out of the running image and disassembled afterwards with
+// scratchpad/disasm_dump.py. Targets chosen to trace `difficulty` -- a value we
+// already drive successfully -- into the record that holds `halflength` one index
+// away:
+//
+//   registrar          the function every field registration calls; its body
+//                      shows where a field's index/name/storage actually goes
+//   registration block the enclosing function of indices 1..10 (currency ..
+//                      bonuspercentage), which builds the record schema and
+//                      names the object in ESI
+//   setting reader     0xa6c4c4, GameSettingHalfLength read by name into a local
+//   setter wrapper     0x663e42, the small SetParam("HALF_LENGTH", v) / ret 4
+//
+// Read-only, once at attach, a few hundred bytes total.
+// BETA 2.26.14: the settings-array writer, found by interactive memory search.
+//
+// Tester narrowed half length to 0x10304CB8 in kickoff mode; the instruction
+// writing it is fifa14.exe+0x12241b8:
+//
+//   add eax, [ebp+8]                     ; index
+//   mov edx, [ebp+0xc]                   ; value
+//   mov [ecx + eax*4 + 0x4384], edx      ; <-- the write
+//   pop ebp ; ret 8
+//
+// with ECX=0x10300934, EAX=0, EDX=8 -> 0x10300934 + 0x4384 = 0x10304CB8. So this
+// is a generic SetSetting(index, value), the settings array starts at
+// this+0x4384, and **half length is index 0**. ECX is heap-allocated, so the
+// absolute address is per-run; the instruction and the index are the durable
+// handles.
+//
+// Log only writes to the half-length slot (eax == 0), which keeps this off the
+// hot path even though the setter itself is generic. Read-only for now: one
+// capture tells us what FUT writes during match setup, and the override is then
+// a single assignment to this.context.edx at the same site.
+const SETTINGS_WRITE_RVA = 0x012241b8;
+const SETTINGS_ARRAY_OFFSET = 0x4384;
+const HALF_LENGTH_SETTING_INDEX = 0;
+// BETA 2.26.15: OFF. Attaching here crashed the game as soon as the tester
+// touched Game Settings / offline (2026-08-18). It is a mid-function hook on a
+// tiny, extremely hot generic setter whose whole body is
+// `add/mov/mov [..]/pop ebp/ret 8` -- there is no room to instrument safely and
+// it runs for every settings write in the UI. Hook the *function entry* instead;
+// the `settings-writer` code dump exists to locate that prologue.
+const SETTINGS_WRITE_HOOK_ENABLED = false;
+const SETTINGS_WRITE_MAX_EMITS = 200;
+let settingsWriteEmits = 0;
+
+function installSettingsWriteHook(fifa) {
+  if (!SETTINGS_WRITE_HOOK_ENABLED) return;
+  const address = fifa.base.add(SETTINGS_WRITE_RVA);
+  // 89 94 81 84 43 00 00 = mov [ecx+eax*4+0x4384], edx
+  const expected = [0x89, 0x94, 0x81, 0x84, 0x43, 0x00, 0x00];
+  const check = verify(address, expected);
+  emit('fifa-settings-write-signature-beta2272', {
+    rva: '0x' + SETTINGS_WRITE_RVA.toString(16), address: address.toString(),
+    matched: check.matched, expected: hexBytes(expected), actual: check.actual,
+    error: check.error || null
+  });
+  if (!check.matched) return;
+  try {
+    Interceptor.attach(address, {
+      onEnter() {
+        let index = null;
+        try { index = this.context.eax.toInt32(); } catch (_) { return; }
+        if (index !== HALF_LENGTH_SETTING_INDEX) return;
+        if (settingsWriteEmits >= SETTINGS_WRITE_MAX_EMITS) return;
+        settingsWriteEmits += 1;
+        let base = null, value = null, target = null;
+        try { base = this.context.ecx; } catch (_) {}
+        try { value = this.context.edx.toInt32(); } catch (_) {}
+        try { target = base.add(SETTINGS_ARRAY_OFFSET + index * 4); } catch (_) {}
+        emit('fifa-settings-write-beta2272', {
+          index: index, value: value,
+          object: base === null ? null : base.toString(),
+          target: target === null ? null : target.toString(),
+          post_match_guard_active: postMatchReturnGuardActive(),
+          thread_id: tid()
+        });
+      }
+    });
+    emit('fifa-settings-write-hook-ready-beta2272', {address: address.toString()});
+  } catch (error) {
+    emit('fifa-settings-write-hook-error-beta2272', {
+      address: address.toString(), error: String(error)
+    });
+  }
+}
+
+// BETA 2.26.16: learn the half-length address, then get out of the way.
+//
+// The full function (dumped from the running image) is 33 bytes:
+//
+//   0x12241a0  push ebp / mov ebp,esp
+//   0x12241a3  mov  eax,[ecx+0x1087c]          ; profile slot
+//   0x12241a9  mov  ecx,[ecx+0x20]             ; the settings block
+//   0x12241ac  imul eax,eax,0x1513             ; profile stride
+//   0x12241b2  add  eax,[ebp+8]                ; + index
+//   0x12241b5  mov  edx,[ebp+0xc]              ; value
+//   0x12241b8  mov  [ecx+eax*4+0x4384],edx     ; 2.26.14 attached HERE -- crash
+//   0x12241bf  pop ebp / ret 8
+//
+// 2.26.14 attached 24 bytes into that, on the hot path of every settings write,
+// and touching Game Settings killed the game. Attach at the *entry* instead, and
+// only long enough to read the operands: settings block = [ecx+0x20], effective
+// index = [ecx+0x1087c]*0x1513 + arg0, so half length lives at
+// block + 0x4384 + effIndex*4. Capture that address once, emit it, detach
+// immediately, and afterwards just read the address directly -- no code patched
+// while the player is actually using the game.
+const SETTINGS_FN_RVA = 0x012241a0;
+const SETTINGS_FN_SIGNATURE = [0x55,0x8b,0xec,0x8b,0x81,0x7c,0x08,0x01,0x00,0x8b,0x49,0x20,0x69,0xc0,0x13,0x15,0x00,0x00];
+const SETTINGS_PROFILE_OFFSET = 0x1087c;
+const SETTINGS_BLOCK_OFFSET = 0x20;
+const SETTINGS_PROFILE_STRIDE = 0x1513;
+const SETTINGS_ONESHOT_ENABLED = true;
+// BETA 2.26.17: the user's configured half length, or 0 when they have not set
+// one -- in which case nothing is forced and the game keeps its own value.
+const CONFIGURED_MATCH_LENGTH_MIN = __CONFIGURED_MATCH_LENGTH_MIN__;
+let halfLengthOriginal = null;
+let halfLengthAddress = null;
+let settingsListener = null;
+let settingsCaptured = false;
+
+function installJITHalfLengthOverride(fifa) {
+  const rva = 0x1222c5f;
+  const address = fifa.base.add(rva);
+  try {
+    Interceptor.attach(address, {
+      onEnter(args) {
+        if (halfLengthAddress !== null && CONFIGURED_MATCH_LENGTH_MIN > 0) {
+          try {
+            if (this.context.ebx.equals(halfLengthAddress)) {
+              let before = halfLengthAddress.readS32();
+              if (before !== CONFIGURED_MATCH_LENGTH_MIN) {
+                halfLengthAddress.writeS32(CONFIGURED_MATCH_LENGTH_MIN);
+                emit('fifa-half-length-jit-override-beta2275', {
+                  address: halfLengthAddress.toString(),
+                  before: before,
+                  requested: CONFIGURED_MATCH_LENGTH_MIN
+                });
+              }
+            }
+          } catch(e) {}
+        }
+      }
+    });
+    emit('fifa-half-length-jit-probe-ready-beta2275', {address: address.toString()});
+  } catch (error) {
+    emit('fifa-half-length-jit-probe-error-beta2275', {error: String(error)});
+  }
+}
+
+function installMatchLoadSettingsCopyHook(fifa) {
+  const address = fifa.base.add(0x122DA4C);
+  try {
+    Interceptor.attach(address, {
+      onEnter(args) {
+        if (halfLengthAddress !== null && CONFIGURED_MATCH_LENGTH_MIN > 0) {
+          try {
+            const before = halfLengthAddress.readS32();
+            if (before !== CONFIGURED_MATCH_LENGTH_MIN) {
+              halfLengthAddress.writeS32(CONFIGURED_MATCH_LENGTH_MIN);
+              emit('fifa-half-length-copy-intercept-beta2277', {
+                address: halfLengthAddress.toString(),
+                before: before,
+                forced_write: CONFIGURED_MATCH_LENGTH_MIN
+              });
+            }
+          } catch(e) {}
+        }
+      }
+    });
+    emit('fifa-half-length-copy-probe-ready-beta2277', {address: address.toString()});
+  } catch (error) {
+    emit('fifa-half-length-copy-probe-error-beta2277', {error: String(error)});
+  }
+}
+
+function installSettingsAddressProbe(fifa) {
+  if (!SETTINGS_ONESHOT_ENABLED) return;
+  const address = fifa.base.add(SETTINGS_FN_RVA);
+  const check = verify(address, SETTINGS_FN_SIGNATURE);
+  emit('fifa-settings-probe-signature-beta2273', {
+    rva: '0x' + SETTINGS_FN_RVA.toString(16), address: address.toString(),
+    matched: check.matched, expected: hexBytes(SETTINGS_FN_SIGNATURE),
+    actual: check.actual, error: check.error || null
+  });
+  if (!check.matched) return;
+  try {
+    settingsListener = Interceptor.attach(address, {
+      onEnter(args) {
+        // BETA 2.26.19: stay attached. Detaching after the first hit assumed the
+        // setter runs every session -- it does not. It only fires when a setting
+        // actually *changes*: the 2026-08-18 22:09 capture caught it moving 4->6,
+        // and 22:25 saw nothing at all because the value was already 6, so the
+        // address was never learned and the override never ran. Remaining
+        // attached costs a rare entry hook (this one has run clean every time,
+        // unlike the mid-function 2.26.14) and catches the write whenever it
+        // happens. Emit once; keep refreshing the address silently after that,
+        // since the block moves between runs.
+        const first = !settingsCaptured;
+        settingsCaptured = true;
+        try {
+          const container = this.context.ecx;
+          const block = container.add(SETTINGS_BLOCK_OFFSET).readPointer();
+          const profile = container.add(SETTINGS_PROFILE_OFFSET).readU32();
+          const effIndex = profile * SETTINGS_PROFILE_STRIDE + HALF_LENGTH_SETTING_INDEX;
+          const target = block.add(SETTINGS_ARRAY_OFFSET + effIndex * 4);
+          halfLengthAddress = target;
+            
+            // IF the game is trying to write to the half length setting, intercept the write itself!
+            if (args[0].toInt32() === HALF_LENGTH_SETTING_INDEX && CONFIGURED_MATCH_LENGTH_MIN > 0) {
+                const wroteValue = args[1].toInt32();
+                if (wroteValue !== CONFIGURED_MATCH_LENGTH_MIN) {
+                    args[1] = ptr(CONFIGURED_MATCH_LENGTH_MIN);
+                    emit('fifa-half-length-intercept-write-beta2276', {
+                        address: target.toString(),
+                        attempted_write: wroteValue,
+                        forced_write: CONFIGURED_MATCH_LENGTH_MIN
+                    });
+                }
+            }
+
+            if (first) {
+            emit('fifa-settings-address-beta2273', {
+              container: container.toString(), block: block.toString(),
+              profile: profile, effective_index: effIndex,
+              half_length_address: target.toString(),
+              value_now: target.readS32(),
+              wrote_index: args[0].toInt32(), wrote_value: args[1].toInt32()
+            });
+          }
+        } catch (error) {
+          emit('fifa-settings-address-error-beta2273', {error: String(error)});
+        }
+      }
+    });
+    emit('fifa-settings-probe-ready-beta2273', {address: address.toString()});
+  } catch (error) {
+    emit('fifa-settings-probe-error-beta2273', {address: address.toString(), error: String(error)});
+  }
+}
+
+// Force the configured half length for the duration of a FUT match.
+//
+// 2026-08-18 22:09 settled what this is worth doing: FUT plays 6 minutes a half
+// using the game's own value (`fifa-half-length-now-beta2273` read 6 at match
+// create *and* at MatchReady), and matchLengthMin never reaches it. The slot is
+// ordinary writable memory, so this is a plain write -- no code patched, nothing
+// to destabilise, which after 2.26.14 is the shape this needs to keep.
+//
+// The slot is global, shared with kickoff mode, so remember what was there and
+// put it back when the match ends. Leaving a user's Kick Off half length
+// silently rewritten would be a nasty surprise.
+function applyHalfLengthOverride(reason) {
+  if (halfLengthAddress === null || CONFIGURED_MATCH_LENGTH_MIN <= 0) return;
+  let before = null;
+  try { before = halfLengthAddress.readS32(); } catch (_) { return; }
+  if (halfLengthOriginal === null && before !== CONFIGURED_MATCH_LENGTH_MIN) {
+    halfLengthOriginal = before;
+  }
+  if (before === CONFIGURED_MATCH_LENGTH_MIN) return;
+  let after = null, error = null;
+  try {
+    halfLengthAddress.writeS32(CONFIGURED_MATCH_LENGTH_MIN);
+    after = halfLengthAddress.readS32();
+  } catch (e) {
+    error = String(e);
+  }
+  emit('fifa-half-length-override-beta2274', {
+    reason: reason, address: halfLengthAddress.toString(),
+    before: before, requested: CONFIGURED_MATCH_LENGTH_MIN, after: after,
+    restore_to: halfLengthOriginal, error: error
+  });
+}
+
+function restoreHalfLength(reason) {
+  if (halfLengthAddress === null || halfLengthOriginal === null) return;
+  let before = null, after = null, error = null;
+  try {
+    before = halfLengthAddress.readS32();
+    halfLengthAddress.writeS32(halfLengthOriginal);
+    after = halfLengthAddress.readS32();
+  } catch (e) {
+    error = String(e);
+  }
+  emit('fifa-half-length-restored-beta2274', {
+    reason: reason, address: halfLengthAddress.toString(),
+    before: before, restored_to: halfLengthOriginal, after: after, error: error
+  });
+  halfLengthOriginal = null;
+}
+
+// Read the slot without any hook at all. Safe to call whenever.
+function reportHalfLength(reason) {
+  if (halfLengthAddress === null) return;
+  let value = null;
+  try { value = halfLengthAddress.readS32(); } catch (_) {}
+  emit('fifa-half-length-now-beta2273', {
+    reason: reason, address: halfLengthAddress.toString(), value: value
+  });
+}
+
+const CODE_DUMP_ENABLED = true;
+const CODE_DUMP_TARGETS = [
+  {name: 'field-registrar',      rva: 0x18571a0, length: 0x140},
+  {name: 'registration-block',   rva: 0x009b1780, length: 0x260},
+  {name: 'game-setting-reader',  rva: 0x00a6c400, length: 0x140},
+  {name: 'half-length-setter',   rva: 0x00663dc0, length: 0x0c0},
+  {name: 'settings-writer',      rva: 0x01224100, length: 0x0e0}
+];
+
+function dumpCodeWindows(fifa) {
+  if (!CODE_DUMP_ENABLED) return;
+  CODE_DUMP_TARGETS.forEach(function (item) {
+    const address = fifa.base.add(item.rva);
+    let bytes = null, error = null;
+    try {
+      bytes = hexBytes(listBytes(address.readByteArray(item.length)));
+    } catch (e) {
+      error = String(e);
+    }
+    emit('fifa-code-dump-beta2271', {
+      name: item.name, rva: '0x' + item.rva.toString(16),
+      address: address.toString(), length: item.length,
+      bytes: bytes, error: error
+    });
+  });
+}
+
+// BETA 2.26.13: OFF. It caught zero calls twice (registration precedes the ~15 s
+// attach), and its trampoline overwrote the first five bytes of the registrar in
+// the code dump -- the window came back starting `jmp <frida>` instead of the
+// real prologue. The static enumeration already recovers the table without it.
+const FIELD_REGISTRY_HOOK_ENABLED = false;
+const FIELD_REGISTRY_MAX_EMITS = 400;
+let fieldRegistryEmits = 0;
+let fieldRegistryHooked = false;
+
+// Enumerate the field table without needing to catch a call.
+//
+// The tracer attaches ~15 s into startup, by which time engine-side registration
+// has already run, so the hook above may legitimately see nothing. The
+// registration sites themselves are still in memory though, and they have a
+// fixed shape:  push offset <name> ; push <index> ; mov ecx,esi ; call <registry>
+// Scan for `6a ?? 8b ce e8`, keep the hits whose call resolves to the registry,
+// and decode the name pointer from the `68 <ptr>` immediately before. That
+// recovers the whole table regardless of when we attached.
+function enumerateFieldRegistrations(fifa, registry) {
+  let hits = [];
+  try {
+    hits = Memory.scanSync(fifa.base.add(HALF_LENGTH_TEXT_RVA), HALF_LENGTH_TEXT_SIZE, '6a ?? 8b ce e8');
+  } catch (error) {
+    emit('fifa-field-table-scan-error-beta2270', {error: String(error)});
+    return;
+  }
+  let decoded = 0;
+  const rows = [];
+  hits.forEach(function (hit) {
+    if (decoded >= FIELD_REGISTRY_MAX_EMITS) return;
+    let rel = 0;
+    try { rel = hit.address.add(5).readS32(); } catch (_) { return; }
+    if (!hit.address.add(9).add(rel).equals(registry)) return;
+    let index = null, namePtr = null, name = null, pushOpcode = null;
+    try { index = hit.address.add(1).readU8(); } catch (_) {}
+    try { pushOpcode = hit.address.sub(5).readU8(); } catch (_) {}
+    if (pushOpcode !== 0x68) return;
+    try { namePtr = hit.address.sub(4).readPointer(); } catch (_) { return; }
+    try { name = cstring(namePtr, 96); } catch (_) {}
+    if (name === null) return;
+    decoded += 1;
+    rows.push({index: index, name: name, site_rva: '0x' + hit.address.sub(fifa.base).toUInt32().toString(16)});
+  });
+  rows.forEach(function (row) { emit('fifa-field-table-beta2270', row); });
+  emit('fifa-field-table-done-beta2270', {
+    candidate_sites: hits.length, decoded: decoded, registry: registry.toString()
+  });
+}
+
+function hookFieldRegistryFrom(site) {
+  if (!FIELD_REGISTRY_HOOK_ENABLED || fieldRegistryHooked) return;
+  let probe = null;
+  try { probe = listBytes(site.add(4).readByteArray(9)); } catch (_) { return; }
+  // 6a <idx> 8b ce e8 <rel32>
+  if (probe[0] !== 0x6a || probe[2] !== 0x8b || probe[3] !== 0xce || probe[4] !== 0xe8) {
+    emit('fifa-field-registry-shape-mismatch-beta2270', {
+      site: site.toString(), bytes: hexBytes(probe)
+    });
+    return;
+  }
+  const declaredIndex = probe[1];
+  let rel = 0;
+  try { rel = site.add(9).readS32(); } catch (_) { return; }
+  const target = site.add(13).add(rel);
+  fieldRegistryHooked = true;
+  try {
+    Interceptor.attach(target, {
+      onEnter(args) {
+        if (fieldRegistryEmits >= FIELD_REGISTRY_MAX_EMITS) return;
+        fieldRegistryEmits += 1;
+        let name = null;
+        try { name = cstring(args[1], 96); } catch (_) {}
+        let index = null;
+        try { index = args[0].toInt32(); } catch (_) {}
+        emit('fifa-field-registry-beta2270', {
+          index: index, name: name,
+          registry: '0x' + this.context.ecx.toUInt32().toString(16),
+          thread_id: tid()
+        });
+      }
+    });
+    emit('fifa-field-registry-hook-ready-beta2270', {
+      site: site.toString(), declared_index: declaredIndex,
+      target: target.toString(), rel: '0x' + (rel >>> 0).toString(16)
+    });
+    // Timing-independent: recover the table from the call sites themselves.
+    enumerateFieldRegistrations(Process.getModuleByName('fifa14.exe'), target);
+  } catch (error) {
+    emit('fifa-field-registry-hook-error-beta2270', {
+      site: site.toString(), target: target.toString(), error: String(error)
+    });
+  }
+}
+// Bytes dumped around each site so the enclosing function can be disassembled
+// offline -- fifa14.exe is packed, so this is the only way to read its code.
+const HALF_LENGTH_SITE_WINDOW_BEFORE = 0xc0;
+const HALF_LENGTH_SITE_WINDOW_AFTER = 0x60;
+
+function scanHalfLengthXrefs(fifa) {
+  if (!HALF_LENGTH_XREF_SCAN_ENABLED) return;
+  const started = nowMs();
+  let total = 0;
+  HALF_LENGTH_STRING_RVAS.forEach(function (item) {
+    const stringAddress = fifa.base.add(item.rva);
+    let actual = null;
+    try { actual = cstring(stringAddress, 64); } catch (_) {}
+    if (actual !== item.name) {
+      emit('fifa-halflength-xref-string-mismatch-beta2268', {
+        name: item.name, rva: '0x' + item.rva.toString(16),
+        address: stringAddress.toString(), found: actual
+      });
+      return;
+    }
+    // little-endian bytes of the runtime string address
+    let value = stringAddress.toUInt32();
+    const pattern = [];
+    for (let i = 0; i < 4; i++) { pattern.push(('0' + (value & 0xff).toString(16)).slice(-2)); value = value >>> 8; }
+    let hits = [];
+    try {
+      hits = Memory.scanSync(fifa.base.add(HALF_LENGTH_TEXT_RVA), HALF_LENGTH_TEXT_SIZE, pattern.join(' '));
+    } catch (error) {
+      emit('fifa-halflength-xref-scan-error-beta2268', {name: item.name, error: String(error)});
+      return;
+    }
+    total += hits.length;
+    // BETA 2.26.9: for the HALF_LENGTH string itself, also watch each site as it
+    // executes. Addresses come from this scan rather than a constant, so a
+    // different unpacked layout cannot silently point the hooks at nothing.
+    // Read-only: the registers at the string push carry the value going in
+    // (setter) or the object being queried (getter).
+    if (item.name === 'halflength' && hits.length > 0) {
+      hookFieldRegistryFrom(hits[0].address);
+    }
+    if (HALF_LENGTH_VALUE_HOOKS_ENABLED && item.name === 'HALF_LENGTH') {
+      hits.slice(0, HALF_LENGTH_MAX_HITS_PER_STRING).forEach(function (hit) {
+        const siteRva = '0x' + hit.address.sub(fifa.base).toUInt32().toString(16);
+        try {
+          Interceptor.attach(hit.address, {
+            onEnter() {
+              const peek = [];
+              try {
+                for (let i = 0; i < 4; i++) peek.push('0x' + this.context.esp.add(i * 4).readU32().toString(16));
+              } catch (_) {}
+              emit('fifa-halflength-value-beta2269', {
+                site_rva: siteRva,
+                ecx: '0x' + this.context.ecx.toUInt32().toString(16),
+                eax: '0x' + this.context.eax.toUInt32().toString(16),
+                edx: '0x' + this.context.edx.toUInt32().toString(16),
+                esi: '0x' + this.context.esi.toUInt32().toString(16),
+                stack: peek, thread_id: tid()
+              });
+            }
+          });
+          emit('fifa-halflength-value-hook-ready-beta2269', {site_rva: siteRva});
+        } catch (error) {
+          emit('fifa-halflength-value-hook-error-beta2269', {site_rva: siteRva, error: String(error)});
+        }
+      });
+    }
+    hits.slice(0, HALF_LENGTH_MAX_HITS_PER_STRING).forEach(function (hit) {
+      // The operand starts at hit; the instruction usually starts a byte or two
+      // earlier. Emit a window either side so it can be disassembled offline.
+      let before = null, after = null;
+      // BETA 2.26.10: dump a disassemblable window at *every* site. None of the
+      // four HALF_LENGTH sites execute during a FUT season match (2026-08-18
+      // 21:02), so the interesting code is now the registration at
+      // DB_HALFLENGTH/halflength -- both of which register half length as field
+      // index 5. After registration the value is addressed by index, never by
+      // name, which is why no name-referencing site runs at match time.
+      const backSpan = HALF_LENGTH_SITE_WINDOW_BEFORE;
+      const fwdSpan = HALF_LENGTH_SITE_WINDOW_AFTER;
+      try { before = hexBytes(listBytes(hit.address.sub(backSpan).readByteArray(backSpan))); } catch (_) {}
+      try { after = hexBytes(listBytes(hit.address.readByteArray(fwdSpan))); } catch (_) {}
+      emit('fifa-halflength-xref-beta2268', {
+        name: item.name,
+        site: hit.address.toString(),
+        site_rva: '0x' + hit.address.sub(fifa.base).toUInt32().toString(16),
+        bytes_before: before, bytes_at: after
+      });
+    });
+    emit('fifa-halflength-xref-summary-beta2268', {
+      name: item.name, hits: hits.length,
+      emitted: Math.min(hits.length, HALF_LENGTH_MAX_HITS_PER_STRING)
+    });
+  });
+  emit('fifa-halflength-xref-scan-done-beta2268', {
+    total_hits: total, elapsed_ms: Math.round(nowMs() - started)
+  });
+}
+// BETA 2.26.20: why the Seasons screen says "Division 0".
+//
+// CardsDLLzf 0x45d1f..0x45d6f builds the label and the UI variable from one
+// value in EBX:
+//
+//   push ebx ; push "FUT_Division_%d" ; call <format>     -> the localisation key
+//   push ebx ; push "OFFLINE_DIV"     ; call [esi]+8      -> the UI variable
+//
+// So whatever EBX holds is what the screen prints. The suspicion is that it is
+// the *tier index* (`11 - divisionId`), which is 0 for an unplaced club -- and
+// season/list has advertised `divisionId: 11` since long before 2.26.2, because
+// §5 requires a record under 11 or the client calls NOSEASONS. Read EBX at the
+// OFFLINE_DIV push and the guess becomes a measurement.
+//
+// This is a mid-function hook, the class that crashed the game at 0x12241b8, so
+// it is deliberately minimal: signature-checked, one register read, an emit cap,
+// and it sits on the Seasons screen build path rather than a hot setter or a
+// teardown dispatch. If a capture shows a crash entering Seasons, set this false.
+const OFFLINE_DIV_HOOK_ENABLED = true;
+const OFFLINE_DIV_RVA = 0x00045d68;
+const OFFLINE_DIV_SIGNATURE = [0x68,0xa4,0x00,0x19,0x10,0x8b,0xce,0xff,0xd2,0x8b,0x5d,0xb0];
+const OFFLINE_DIV_STRING_RVA = 0x001900a4;
+const OFFLINE_DIV_MAX_EMITS = 40;
+let offlineDivEmits = 0;
+
+function installOfflineDivProbe(module) {
+  if (!OFFLINE_DIV_HOOK_ENABLED) return;
+  const address = module.base.add(OFFLINE_DIV_RVA);
+  const built = futGameplayEventSignature(module, {stringRva: OFFLINE_DIV_STRING_RVA, tail: OFFLINE_DIV_SIGNATURE.slice(5)});
+  const check = verify(address, built.signature);
+  let pushed = null;
+  try { pushed = cstring(built.stringAddress, 32); } catch (_) {}
+  emit('fifa-offline-div-signature-beta2275', {
+    rva: '0x' + OFFLINE_DIV_RVA.toString(16), address: address.toString(),
+    pushed_name: pushed, name_matches: pushed === 'OFFLINE_DIV',
+    matched: check.matched, expected: hexBytes(built.signature), actual: check.actual,
+    error: check.error || null
+  });
+  if (!check.matched) return;
+  try {
+    Interceptor.attach(address, {
+      onEnter() {
+        if (offlineDivEmits >= OFFLINE_DIV_MAX_EMITS) return;
+        offlineDivEmits += 1;
+        let value = null;
+        try { value = this.context.ebx.toInt32(); } catch (_) {}
+        emit('fifa-offline-div-beta2275', {
+          value: value,
+          as_division_if_tier_index: value === null ? null : 11 - value,
+          thread_id: tid()
+        });
+      }
+    });
+    emit('fifa-offline-div-hook-ready-beta2275', {address: address.toString()});
+  } catch (error) {
+    emit('fifa-offline-div-hook-error-beta2275', {address: address.toString(), error: String(error)});
+  }
+}
+
+const GAMEPLAY_PARAM_HOOKS_ENABLED = true;
+const GAMEPLAY_PARAM_TARGETS = [
+  {param:'HALF_LENGTH', rva:0x000d088d, stringRva:0x001a1630, tail:[0x8b,0xce,0xff,0xd0,0x8b,0x45,0xf8,0x3b,0xc7,0x74,0x05]},
+  {param:'AI_GROUP',    rva:0x000d08ab, stringRva:0x001a1624, tail:[0x8b,0xce,0xff,0xd0,0x8b,0x45,0xf8,0x3b,0xc7,0x74,0x08]}
+];
+const FUT_GAMEPLAY_EVENT_HOOKS_ENABLED = false;
+const FUT_GAMEPLAY_EVENT_TARGETS = [
+  {event:'FUTOnlineDisconnect',      rva:0x0009a418, stringRva:0x0019c8b0, tail:[0x8b,0xce,0xff,0xd0,0x85,0xf6,0x74,0x09,0x8b,0x16,0x8b]},
+  {event:'FUTOnlineDisconnect',      rva:0x0009c854, stringRva:0x0019c8b0, tail:[0x8b,0xcb,0xff,0xd0,0xe9,0x49,0x01,0x00,0x00,0x80,0xbe]},
+  {event:'FUTOnlineDisconnect',      rva:0x000a1510, stringRva:0x0019c8b0, tail:[0x8b,0xcf,0xff,0xd2,0xe9,0xc3,0x02,0x00,0x00,0x80,0xbe]},
+  {event:'FUTServerErrorInGameplay', rva:0x0009c824, stringRva:0x0019c908, tail:[0x8b,0xcb,0xff,0xd0,0xe9,0x79,0x01,0x00,0x00,0x80,0xbe]},
+  {event:'FUTServerErrorInGameplay', rva:0x0009c874, stringRva:0x0019c908, tail:[0x8b,0xcb,0xff,0xd0,0xe9,0x29,0x01,0x00,0x00,0x8b,0x4d]},
+  {event:'FUTServerErrorInGameplay', rva:0x000a154a, stringRva:0x0019c908, tail:[0x8b,0xcf,0xff,0xd0,0xe9,0x89,0x02,0x00,0x00,0x8b,0xce]},
+  {event:'FUTOnlinePeerDisconnect',  rva:0x000a14b3, stringRva:0x0019d500, tail:[0x6a,0x00,0x50,0x8b,0x42,0x10,0xff,0xd0,0xeb,0x1b,0xe8]},
+  {event:'FUTOnlinePeerDisconnect',  rva:0x000a14d3, stringRva:0x0019d500, tail:[0x6a,0x00,0x50,0xff,0xd2,0x8b,0x07,0x8b,0x50,0x40,0x83]},
+  {event:'EnterPostGame',            rva:0x000a14e5, stringRva:0x0019d4f0, tail:[0x8b,0xcf,0xff,0xd2,0x8b,0x03,0x8b,0x50,0x04,0x8b,0xcb]}
+];
 const REMOTE_REDIRECTOR_PORT = 42127;
 const LOCAL_REDIRECTOR_PORT = 42129;
 const REDIRECT_PORTS = new Set([REMOTE_REDIRECTOR_PORT, 44125, 8099]);
@@ -421,6 +1129,11 @@ const HEAVY_TRACE_FORBIDDEN_KINDS = new Set(['match-create-or-result', 'match-en
 // three arrays, so tracing it with backtraces would stall the Store the same way
 // it stalled match creation. Key names alone answer what the offer parser reads.
 const CHEAP_TRACE_KINDS = new Set(['store-purchasegroup']);
+// The four _global events the season/user and season/list handlers end in.
+// SUCCESS/FAIL come off the seasonId selector at 0x100621d0, NOSEASONS off the
+// list scan that finds no record matching the client's own division index
+// (0x100623e5), VERSION_MISMATCH off the save-version branch at 0x1006217f.
+const SEASON_VERDICT_EVENTS = new Set(['SUCCESS', 'FAIL', 'NOSEASONS', 'VERSION_MISMATCH']);
 let competitionOperationIndexes = Object.create(null);
 let navSendActionFunction = null;
 // BETA 2.23: an offline DestroyMatch can complete successfully while the retail
@@ -435,6 +1148,10 @@ let postMatchReturnGuardGeneration = 0;
 let postMatchReturnGuardLastArmMs = 0;
 let postMatchReturnGuardArmedMs = 0;
 let postMatchReturnGuardFromMatchEnd = false;
+// BETA 2.26.2: a forfeit sends /match/end too. Remember which kind of DestroyMatch
+// armed the guard so the fcc_logout decision can tell "played it out" from
+// "gave up", which the from_match_end flag alone cannot.
+let postMatchReturnGuardForfeit = false;
 let postMatchFccLogoutRedirects = 0;
 let postMatchFccLogoutPassthroughs = 0;
 const POST_MATCH_RETURN_GUARD_MS = 45000;
@@ -446,7 +1163,19 @@ const ACTIVE_MATCH_RETURN_GUARD_MS = 45 * 60 * 1000;
 // the redirect sent a tearing-down client to GameHub -- the "Leaving Ultimate
 // Team" hang. No real match, forfeit included, reaches its logout this fast, so
 // a pre-armed guard stays out of the way until a match could plausibly have been
-// played. A guard armed by an observed /match/end is exempt: that one is proof.
+// played.
+//
+// BETA 2.26.2: that floor originally carried an exemption -- a guard armed by an
+// observed /match/end was treated as proof a match had been played. It is not.
+// A forfeit sends /match/end as well, so the exemption switched the floor off for
+// the one case the sentence above names explicitly, and the 2026-08-17 00:26
+// capture is the result: CreateMatch 00:26:11.65, MatchReady 00:26:33.31,
+// /match/end {"endReason":"QUIT"} 00:26:39.39, fcc_logout 00:26:45.10 at
+// armed_age_ms=33454 -- a third of the floor -- redirected to GameHub, and the
+// client stalled there (no GET /hub, Blaze silent). That was the first time this
+// redirect had ever fired in any capture. The floor now applies on its own, and a
+// DestroyMatch that reports QUIT/DNF never redirects at whatever age: a forfeited
+// client is tearing its session down, and stranding it on GameHub is the hang.
 const PRE_ARM_MIN_ELAPSED_MS = 90000;
 const postMatchStayInFutView = Memory.allocUtf8String('external/ion_fut/screens/gameHub/GameHub');
 const authenticatedIcebreakerAction = Memory.allocUtf8String('iceBreaker');
@@ -467,9 +1196,9 @@ function armPostMatchReturnGuard(source, durationMs, fromMatchEnd) {
   postMatchReturnGuardGeneration += 1;
   postMatchReturnGuardLastArmMs = currentMs;
   postMatchReturnGuardUntilMs = currentMs + windowMs;
-  // MatchReady re-arms while a match is being set up. Keep the age of the
-  // *first* arm of this match so the pre-arm floor measures the whole setup,
-  // not the last packet before the client bailed.
+  // The age clock is (re)started by CreateMatch/MatchReady in
+  // noteCompetitionHttpRequest, so that it measures *this* match's setup. This
+  // only backstops a guard armed with no clock at all.
   if (!postMatchReturnGuardArmedMs || (currentMs - postMatchReturnGuardArmedMs) > ACTIVE_MATCH_RETURN_GUARD_MS) {
     postMatchReturnGuardArmedMs = currentMs;
   }
@@ -478,6 +1207,7 @@ function armPostMatchReturnGuard(source, durationMs, fromMatchEnd) {
     generation:postMatchReturnGuardGeneration, source:String(source || 'socket'),
     window_ms:windowMs, until_ms:postMatchReturnGuardUntilMs,
     from_match_end:postMatchReturnGuardFromMatchEnd,
+    forfeit:postMatchReturnGuardForfeit,
     armed_age_ms:currentMs - postMatchReturnGuardArmedMs, thread_id:tid()
   });
 }
@@ -522,7 +1252,18 @@ function noteCompetitionHttpRequest(text, source) {
   let kind = '';
   if (lowered.indexOf('/ut/game/fifa14/match/end') >= 0) {
     kind = 'match-end';
+    // send()/WSASend() expose one write, which for DestroyMatch carries headers
+    // and body together (the observed request is ~700 bytes, well inside the
+    // 4096-byte preview). When the body is visible and reports QUIT/DNF, this is
+    // a forfeit, not a played match. If a client ever splits the body into its
+    // own write the flag simply stays false and PRE_ARM_MIN_ELAPSED_MS decides.
+    if (lowered.indexOf('"endreason":"quit"') >= 0 || lowered.indexOf('"endreason":"dnf"') >= 0 ||
+        lowered.indexOf('"endreason": "quit"') >= 0 || lowered.indexOf('"endreason": "dnf"') >= 0) {
+      postMatchReturnGuardForfeit = true;
+    }
     armPostMatchReturnGuard(source, POST_MATCH_RETURN_GUARD_MS, true);
+    reportHalfLength('match-end');
+    restoreHalfLength('match-end');
   }
   else if (lowered.indexOf(' /ut/game/fifa14/season/list') >= 0) kind = 'season-list';
   else if (lowered.indexOf(' /ut/game/fifa14/season/user') >= 0) kind = 'season-user';
@@ -533,6 +1274,28 @@ function noteCompetitionHttpRequest(text, source) {
   else if (lowered.indexOf(' /ut/game/fifa14/tournament/user/') >= 0) kind = 'tournament-user-update';
   else if (lowered.indexOf(' /ut/game/fifa14/match') >= 0 && lowered.indexOf('/match/reset') < 0) {
     kind = 'match-create-or-result';
+    // CreateMatch/MatchReady both land here and both precede this match's
+    // DestroyMatch, so this is the right place to drop *everything* the previous
+    // match left behind rather than carry it into the next one.
+    //
+    // BETA 2.26.4: this used to clear only the forfeit verdict, and the age clock
+    // was kept across matches on purpose ("measure the whole setup"). Both were
+    // wrong once a session contains more than one match. The 2026-08-17 02:57
+    // capture: forfeit at 02:56:53, new match created 02:57:26, client bailed
+    // during setup 1.8 s later with no MatchReady and no DestroyMatch -- the
+    // textbook pre-kickoff bail -- but the guard reported armed_age_ms=105867
+    // (measured from the *first* match at 02:55:40) and a sticky
+    // from_match_end=true from the previous match's forfeit. The 90-second floor
+    // was therefore long past, the redirect fired, and the client stranded on
+    // GameHub: "lost connection to Origin servers" then a hang on Leaving
+    // Ultimate Team. Every new match starts its own clock with a clean slate.
+    postMatchReturnGuardForfeit = false;
+    postMatchReturnGuardFromMatchEnd = false;
+    postMatchReturnGuardArmedMs = nowMs();
+    // What is half length actually set to as a FUT match is being built? Reading
+    // the address needs no hook, so this costs nothing and cannot destabilise.
+    reportHalfLength('match-create-or-ready');
+    applyHalfLengthOverride('match-create-or-ready');
     // A completed PC match may submit DestroyMatch through a network path that
     // our send/WSASend hook does not observe after gameplay. Pre-arm the one-shot
     // return repair when CreateMatch is observed and keep it valid for a normal
@@ -3399,6 +4162,9 @@ function attachCardsHooksOnce(reason) {
   });
 
   installCupResumeLookupDiagnostic(module);
+  installFutGameplayEventDiagnostic(module);
+  installGameplayParamDiagnostic(module);
+  installOfflineDivProbe(module);
 
   installCardsHook(module, byName['JSON key mapper'], {
     onEnter(args) {
@@ -3808,14 +4574,21 @@ function installFifaNavHooks(fifa) {
               // A logout this soon after CreateMatch is the client abandoning
               // match setup, not returning from one. Let it take its own route:
               // redirecting it strands a session that is already tearing down.
-              const tooEarly = !postMatchReturnGuardFromMatchEnd && armedAgeMs < PRE_ARM_MIN_ELAPSED_MS;
+              // A forfeit is the same abandonment with a DestroyMatch attached,
+              // so it never redirects regardless of how long setup took.
+              const forfeit = postMatchReturnGuardForfeit;
+              const tooEarly = forfeit || armedAgeMs < PRE_ARM_MIN_ELAPSED_MS;
               if (tooEarly) {
                 postMatchFccLogoutPassthroughs += 1;
                 emit('fifa-prematch-fcc-logout-passthrough-beta2260', {
                   generation:guardGeneration, view:originalView, armed_age_ms:armedAgeMs,
                   min_elapsed_ms:PRE_ARM_MIN_ELAPSED_MS, remaining_ms:remainingMs,
                   passthrough_count:postMatchFccLogoutPassthroughs,
-                  rationale:'guard was pre-armed by CreateMatch and no /match/end was seen; the client is leaving before kickoff, so do not rewrite its logout route.',
+                  forfeit:forfeit, from_match_end:postMatchReturnGuardFromMatchEnd,
+                  reason:forfeit ? 'destroy-match-reported-quit-or-dnf' : 'below-min-elapsed',
+                  rationale:forfeit
+                    ? 'DestroyMatch reported QUIT/DNF; the client forfeited rather than played, and it is tearing the session down. Rewriting its logout route is what strands it on a GameHub that never finishes loading.'
+                    : 'the client is leaving before a match could plausibly have been played, so do not rewrite its logout route.',
                   thread_id:tid(), return_address:safePtr(this.returnAddress)
                 });
               } else {
@@ -3828,13 +4601,27 @@ function installFifaNavHooks(fifa) {
                   generation:guardGeneration, original_view:originalView, replacement_view:view,
                   remaining_ms:remainingMs, armed_age_ms:armedAgeMs,
                   from_match_end:postMatchReturnGuardFromMatchEnd,
+                  forfeit:postMatchReturnGuardForfeit,
                   redirect_count:postMatchFccLogoutRedirects,
                   rationale:'DestroyMatch completed locally; keep CardsDLL/FUT loaded instead of taking the stale disconnected-from-in-game logout route.',
                   thread_id:tid(), return_address:safePtr(this.returnAddress)
                 });
               }
             }
-            if (view && view.toLowerCase().endsWith('/fcc_login1')) { fccLogin1Active = true; fccLogin2Active = false; }
+            if (view && view.toLowerCase().endsWith('/fcc_login1')) {
+              fccLogin1Active = true; fccLogin2Active = false;
+              // BETA 2.26.5: entering FUT starts a new session, so nothing the
+              // previous one left behind may still speak for it. The 2026-08-17
+              // 23:43 capture logged a logout carrying forfeit=true and
+              // from_match_end=true that belonged to a match 34 seconds and one
+              // whole FUT session earlier -- those flags are only cleared by a
+              // CreateMatch, and that session never created one. It happened to
+              // reach the right answer; it had no business reaching it that way.
+              postMatchReturnGuardForfeit = false;
+              postMatchReturnGuardFromMatchEnd = false;
+              postMatchReturnGuardArmedMs = 0;
+              postMatchReturnGuardUntilMs = 0;
+            }
             if (view && view.toLowerCase().endsWith('/fcc_login2')) { fccLogin2Active = true; fccLogin1Active = false; }
             if (view && view.toLowerCase().indexOf('/icebreaker/futpackselect') >= 0) futPackSelectActive = true;
             if (!RUNTIME_PERFORMANCE_MODE || postMatchRedirected || (view && (view.toLowerCase().endsWith('/fcc_login1') || view.toLowerCase().endsWith('/fcc_login2') || view.toLowerCase().indexOf('/icebreaker/futpackselect') >= 0))) {
@@ -3851,6 +4638,12 @@ function installFifaNavHooks(fifa) {
           } else if (item.name === 'NAV::sendAction') {
             if (!RUNTIME_PERFORMANCE_MODE) emit('fifa-nav-send-action', {...common, action:cstring(args[1],512), parameter:cstring(args[2],768)});
           } else {
+            // The season verdicts do NOT come through here -- allowlisting them
+            // on this hook caught nothing in the 2026-08-17 03:50 capture. They
+            // are dispatched through SCREEN_EVENT_DISPATCHER_RVA in fifa14.exe,
+            // where SEASON_VERDICT_EVENTS is applied instead. Leave this one
+            // fully off in performance mode: it is a hot dispatcher and reading
+            // the name on every call bought nothing.
             if (!RUNTIME_PERFORMANCE_MODE) emit('fifa-nav-send-screen-event', {...common, event:cstring(args[1],512), payload:cstring(args[2],1024)});
           }
         }
@@ -3913,6 +4706,108 @@ function installAssertReporterDiagnostic(fifa) {
     });
     return false;
   }
+}
+
+// Build the expected `push <relocated string>` + tail for this module's base, so
+// the check survives ASLR/rebasing instead of pinning the file's own operand.
+function futGameplayEventSignature(module, item) {
+  const target = module.base.add(item.stringRva);
+  const operand = [];
+  let value = target.toUInt32();
+  for (let i = 0; i < 4; i++) { operand.push(value & 0xff); value = value >>> 8; }
+  return {signature: [0x68].concat(operand, item.tail), stringAddress: target};
+}
+function installGameplayParamDiagnostic(module) {
+  if (!GAMEPLAY_PARAM_HOOKS_ENABLED) return false;
+  let installed = 0;
+  GAMEPLAY_PARAM_TARGETS.forEach(function (item) {
+    const address = module.base.add(item.rva);
+    const built = futGameplayEventSignature(module, item);
+    const check = verify(address, built.signature);
+    let pushedName = null;
+    try { pushedName = cstring(built.stringAddress, 64); } catch (_) {}
+    emit('fifa-gameplay-param-signature-beta2267', {
+      param: item.param, rva: '0x' + item.rva.toString(16), address: address.toString(),
+      module_base: module.base.toString(), pushed_name: pushedName,
+      name_matches: pushedName === item.param, matched: check.matched,
+      expected: hexBytes(built.signature), actual: check.actual, error: check.error || null
+    });
+    if (!check.matched) return;
+    try {
+      Interceptor.attach(address, {
+        onEnter() {
+          // EAX holds the value the two instructions above just loaded out of
+          // the competition record (or the null-record fallback).
+          let value = null;
+          try { value = this.context.eax.toInt32(); } catch (_) {}
+          emit('fifa-gameplay-param-beta2267', {
+            param: item.param, value: value,
+            value_hex: value === null ? null : '0x' + (value >>> 0).toString(16),
+            rva: '0x' + item.rva.toString(16), thread_id: tid()
+          });
+        }
+      });
+      installed += 1;
+    } catch (error) {
+      emit('fifa-gameplay-param-hook-error-beta2267', {
+        param: item.param, rva: '0x' + item.rva.toString(16), error: String(error)
+      });
+    }
+  });
+  emit('fifa-gameplay-param-hooks-ready-beta2267', {
+    installed: installed, total: GAMEPLAY_PARAM_TARGETS.length
+  });
+  return installed > 0;
+}
+
+function installFutGameplayEventDiagnostic(module) {
+  let installed = 0;
+  FUT_GAMEPLAY_EVENT_TARGETS.forEach(function (item) {
+    const address = module.base.add(item.rva);
+    const built = futGameplayEventSignature(module, item);
+    const check = verify(address, built.signature);
+    let pushedName = null;
+    try { pushedName = cstring(built.stringAddress, 64); } catch (_) {}
+    emit('fifa-fut-gameplay-event-signature-beta2262', {
+      event: item.event, rva: '0x' + item.rva.toString(16), address: address.toString(),
+      module_base: module.base.toString(), string_address: built.stringAddress.toString(),
+      pushed_name: pushedName, name_matches: pushedName === item.event,
+      matched: check.matched, expected: hexBytes(built.signature),
+      actual: check.actual, error: check.error || null,
+      attach_enabled: FUT_GAMEPLAY_EVENT_HOOKS_ENABLED
+    });
+    if (!check.matched) return;
+    if (!FUT_GAMEPLAY_EVENT_HOOKS_ENABLED) return;
+    try {
+      Interceptor.attach(address, {
+        onEnter() {
+          // These fire on a session-level decision, not per frame, so a backtrace
+          // is affordable -- but check the budget before paying for one anyway
+          // (rule 4a: the cap stops the send, not the work).
+          const detailed = emitBudgetLeft('fifa-fut-gameplay-event-beta2262');
+          emit('fifa-fut-gameplay-event-beta2262', {
+            event: item.event, rva: '0x' + item.rva.toString(16), thread_id: tid(),
+            post_match_guard_active: postMatchReturnGuardActive(),
+            post_match_from_match_end: postMatchReturnGuardFromMatchEnd,
+            post_match_forfeit: postMatchReturnGuardForfeit,
+            return_address: safePtr(this.returnAddress),
+            backtrace: detailed ? normalizedBacktrace(this.context) : null
+          });
+        }
+      });
+      installed += 1;
+    } catch (error) {
+      emit('fifa-fut-gameplay-event-hook-error-beta2262', {
+        event: item.event, rva: '0x' + item.rva.toString(16), error: String(error)
+      });
+    }
+  });
+  emit('fifa-fut-gameplay-event-hooks-ready-beta2262', {
+    installed: installed, total: FUT_GAMEPLAY_EVENT_TARGETS.length,
+    attach_enabled: FUT_GAMEPLAY_EVENT_HOOKS_ENABLED,
+    note: FUT_GAMEPLAY_EVENT_HOOKS_ENABLED ? null : 'signatures verified, attaching deliberately disabled'
+  });
+  return installed > 0;
 }
 
 function installCupResumeLookupDiagnostic(module) {
@@ -4105,6 +5000,13 @@ if (buildOk) {
   installMatchEntityTableDiagnostic(fifa);
   // Armed early so any assert anywhere in the session reports its own text.
   installAssertReporterDiagnostic(fifa);
+  scanHalfLengthXrefs(fifa);
+  dumpCodeWindows(fifa);
+  installSettingsWriteHook(fifa);
+  installSettingsAddressProbe(fifa);
+  installMatchLoadSettingsCopyHook(fifa);
+  installJITHalfLengthOverride(fifa);
+  installJITHalfLengthOverride(fifa);
   try {
     navSendActionFunction = new NativeFunction(fifa.base.add(0x006fda50), 'void', ['pointer','pointer','pointer'], 'stdcall');
     emit('authenticated-icebreaker-nav-send-action-callable', {address:fifa.base.add(0x006fda50).toString(), calling_convention:'stdcall', ignored_arg0:true});
@@ -4187,7 +5089,12 @@ if (buildOk) {
   Interceptor.attach(fifa.base.add(SCREEN_EVENT_DISPATCHER_RVA), {onEnter(args) {
     const scope = cstring(args[0], 128);
     const event = cstring(args[1], 256);
-    const baselineEvent = event === 'LoginToFUT' || event === 'RetrieveTrustedConsoleListResult' || event === 'RetrievePhishingQuestionResult' || event === 'ValidatePhishingAnswerResult' || event === 'FutDllUnloaded' || event === 'FUTCfgFileDownloadResult' || (futPackSelectActive && (event === 'ShowLoadingIcon' || event === 'HideLoadingIcon' || event === 'ResetLoadingIcon' || event === 'StartNetworkOperation' || event === 'EndNetworkOperation'));
+    // BETA 2.26.2: the season handlers' own verdict on the documents we serve.
+    // These are dispatched through *this* function, not NAV::sendScreenEvent --
+    // the first attempt allowlisted them there and caught nothing. Scope-gated to
+    // _global because SUCCESS/FAIL are generic names used all over the frontend.
+    const seasonVerdict = scope === '_global' && SEASON_VERDICT_EVENTS.has(event);
+    const baselineEvent = seasonVerdict || event === 'LoginToFUT' || event === 'RetrieveTrustedConsoleListResult' || event === 'RetrievePhishingQuestionResult' || event === 'ValidatePhishingAnswerResult' || event === 'FutDllUnloaded' || event === 'FUTCfgFileDownloadResult' || (futPackSelectActive && (event === 'ShowLoadingIcon' || event === 'HideLoadingIcon' || event === 'ResetLoadingIcon' || event === 'StartNetworkOperation' || event === 'EndNetworkOperation'));
     const postOverrideEvent = (controlledOverrideApplied || controlledQuestionOverrideApplied || controlledValidationOverrideApplied) && trustedWindowActive && event !== 'updateTimeCount';
     if (baselineEvent || postOverrideEvent) {
       const payloads = [];
@@ -4201,7 +5108,7 @@ if (buildOk) {
           }
         }
       } catch (_) {}
-      emit('trusted-console-screen-event', {thread_id: tid(), scope: scope, event: event, payloads: payloads});
+      emit('trusted-console-screen-event', {thread_id: tid(), scope: scope, event: event, payloads: payloads, season_verdict: seasonVerdict});
     }
     if (event === 'ValidatePhishingAnswerResult') {
       const payloads = [];
@@ -4295,7 +5202,7 @@ emit('native-authenticated-icebreaker-mode-armed', {trusted: true, changed: fals
 
 send({
   kind: 'native-fut-nav-route-patch-trace-ready', pid: Process.id, hooks_enabled: buildOk,
-  contract_revision: 'captain-v6-plus-fcc-login1-no-loading-v16-competition-v3-match-postmatch-v1',
+  contract_revision: 'captain-v6-plus-fcc-login1-no-loading-v16-competition-v3-match-postmatch-v2-forfeit',
   instrumentation: buildOk ? [
     'connect/WSAConnect localhost redirect', 'CA update hook', 'narrow LoginToFUT event trigger',
     'native GetStadiumID/provider +0x78/+0x7c Town Park bridge for offline matches',
@@ -4307,7 +5214,8 @@ send({
     'FIFA 14 1000-byte CAS JSON builder and operation-23 /ut/auth submit tracing',
     'generic FUT WebSession response allocation/scalar callbacks plus SID propagation tracing',
     'early outgoing season/tournament HTTP request arming (15-second parser window) with unrestricted parser-scoped JSON key IDs/return addresses/backtraces',
-    'one-shot post-match /match/end guard that rewrites only the stale fcc_logout return to the normal FUT GameHub view',
+    'one-shot post-match /match/end guard that rewrites only the stale fcc_logout return to the normal FUT GameHub view, never a forfeit and never below the minimum elapsed match time',
+    'read-only capture of the four CardsDLL gameplay session events (EnterPostGame, FUTServerErrorInGameplay, FUTOnlineDisconnect, FUTOnlinePeerDisconnect)',
     'read-only enumeration and targeted hooks for season/tournament operation descriptors and service API slots',
     'CardsDLL operations 89, 91 and 92 launch/callback paths', 'trusteddevice, phishing question and validation URL builders',
     'response allocation/parsing and accurate backtraces', 'dynamic WebSession dispatch target and state',
@@ -4345,7 +5253,29 @@ send({
         .replace("__UPDATE_SIGNATURE__", _js_bytes(UPDATE_SIGNATURE))
         .replace("__DISPATCH_SIGNATURE__", _js_bytes(SCREEN_EVENT_DISPATCHER_SIGNATURE))
         .replace("__LOCAL_OFFLINE_STADIUM_ID__", str(_configured_offline_stadium_id()))
+        .replace("__CONFIGURED_MATCH_LENGTH_MIN__", str(_configured_match_length_min()))
     )
+
+
+def _configured_match_length_min() -> int:
+    """The half length the agent forces during a FUT match, or 0 to leave it be.
+
+    Deliberately *not* defaulted to the server's 6: a value here overwrites a
+    global the Kick Off menu also uses, so it is only applied when the user has
+    actually asked for one. Never raises, for the same reason as the stadium
+    helper below.
+    """
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server"))
+        from fut_local_settings import load_settings
+
+        raw = load_settings().get("matchLengthMin")
+        if raw is None:
+            return 0
+        value = int(raw)
+        return value if 1 <= value <= 11 else 0
+    except Exception:
+        return 0
 
 
 def _configured_offline_stadium_id(default: int = 26) -> int:
@@ -4531,3 +5461,10 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
+
+
+
+

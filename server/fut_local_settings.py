@@ -174,6 +174,26 @@ def _load_settings_uncached(path: Path) -> dict[str, Any]:
         if cleaned_club:
             settings["club"] = cleaned_club
 
+    # Half length in minutes for offline FUT competitions. CardsDLL pushes this
+    # into the gameplay params as HALF_LENGTH (CardsDLLzf 0x100d088d, from the
+    # competition record it built out of this JSON), so unlike the old
+    # `matchlength` menu label this one is expected to reach gameplay. Retail
+    # exposes ONL_HALF_LENGTH_1..11, so clamp to that range.
+    length = raw.get("matchLengthMin")
+    if length is not None:
+        try:
+            cleaned_length = int(length)
+        except (TypeError, ValueError):
+            _diagnostic(f"matchLengthMin is not a number ({length!r}); keeping the built-in value")
+        else:
+            if 1 <= cleaned_length <= 11:
+                settings["matchLengthMin"] = cleaned_length
+            else:
+                _diagnostic(
+                    f"matchLengthMin must be 1..11 minutes, not {cleaned_length}; "
+                    "keeping the built-in value"
+                )
+
     market = raw.get("market")
     if isinstance(market, dict):
         cleaned_market = {}

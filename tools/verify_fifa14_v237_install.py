@@ -157,9 +157,92 @@ def main() -> int:
     require(frida_trace, (
         "noteCompetitionHttpRequest", "season-list", "season-user",
         "tournament-list", "tournament-teams", "tournament-user-list",
-        "competition-v3-match-postmatch-v1", "durationMs || 15000",
+        "competition-v3-match-postmatch-v2-forfeit", "durationMs || 15000",
         "fifa-postmatch-return-guard-armed-beta223", "fifa-postmatch-fcc-logout-redirect-beta223",
         "postMatchStayInFutView", "ut/game/fifa14/match/end",
+        # BETA 2.26.2. The fcc_logout rewrite must stay off two routes: a client
+        # that bailed before a match could plausibly have been played, and a
+        # forfeit. Both are a session already tearing down, and redirecting one to
+        # GameHub is the "Leaving Ultimate Team" hang (2026-08-17 00:26 capture).
+        # Pin the decision itself, not just the emit names: the 2026-08-14 fix
+        # shipped with no verifier at all, and the from_match_end exemption it
+        # carried silently switched the floor back off for exactly the forfeit
+        # case its own comment named.
+        "fifa-prematch-fcc-logout-passthrough-beta2260", "PRE_ARM_MIN_ELAPSED_MS = 90000",
+        "const tooEarly = forfeit || armedAgeMs < PRE_ARM_MIN_ELAPSED_MS;",
+        "postMatchReturnGuardForfeit",
+        # BETA 2.26.4. The age clock and the from-match-end flag must be reset by
+        # each new match, or a second match in the same session inherits the
+        # first's age (105 s) and the previous match's forfeit flag, the floor is
+        # long past, and a pre-kickoff bail gets redirected onto a GameHub that
+        # never finishes loading -- the 2026-08-17 02:57 "Leaving Ultimate Team"
+        # hang. Replay every known case with scratchpad/replay_guard3.js.
+        "postMatchReturnGuardFromMatchEnd = false;",
+        "postMatchReturnGuardArmedMs = nowMs();",
+        # The gameplay-session events that name why the client gave up. The push
+        # operand at each site is a *relocated* string address and CardsDLLzf does
+        # not load at its preferred base (0x37ea0000 in the 2026-08-17 01:39
+        # capture), so the signature has to be rebuilt against module.base. The
+        # first cut pinned the file's own operand, missed all nine sites by two
+        # bytes, installed zero hooks and reported nothing -- pin the rebasing.
+        "FUT_GAMEPLAY_EVENT_TARGETS", "fifa-fut-gameplay-event-beta2262",
+        "FUTOnlineDisconnect", "FUTServerErrorInGameplay", "EnterPostGame",
+        "futGameplayEventSignature", "stringRva", "module.base.add(item.stringRva)",
+        # The client's own verdict on the season documents. These are dispatched
+        # through SCREEN_EVENT_DISPATCHER_RVA in fifa14.exe, NOT through
+        # NAV::sendScreenEvent -- allowlisting them on the latter caught nothing
+        # in the 2026-08-17 03:50 capture. Scope-gate to _global: SUCCESS/FAIL
+        # are generic names used all over the frontend.
+        "SEASON_VERDICT_EVENTS", "NOSEASONS", "VERSION_MISMATCH",
+        "scope === '_global' && SEASON_VERDICT_EVENTS.has(event)",
+        # Attaching to the gameplay-event push sites must stay behind a gate.
+        # FIFA died 6 ms after the one run with them armed; the fault is in the
+        # client's own handler and 0xcdcdcd** faults predate the hook, but a
+        # mid-function hook on a tearing-down dispatch is not excludable and the
+        # answer it was there to get (FUTOnlineDisconnect, rva 0x9a418) is banked.
+        "FUT_GAMEPLAY_EVENT_HOOKS_ENABLED", "attach_enabled",
+        # BETA 2.26.7. Read-only capture of what the client actually pushes into
+        # the gameplay parameters. matchLengthMin reaches the parser but does not
+        # shorten the half, so HALF_LENGTH is read at the push (0xd088d) with
+        # AI_GROUP (0xd08ab) alongside as the known-good control.
+        "GAMEPLAY_PARAM_TARGETS", "fifa-gameplay-param-beta2267", "HALF_LENGTH", "AI_GROUP",
+        # BETA 2.26.8. fifa14.exe is packed (.text vsize 0x3829000 vs rawsize
+        # 0x1749a00), so its half-length strings have zero xrefs on disk and the
+        # referencing code only exists at runtime. Do the xref while it runs.
+        "HALF_LENGTH_STRING_RVAS", "fifa-halflength-xref-beta2268", "Memory.scanSync",
+        # BETA 2.26.9. Watch the HALF_LENGTH sites execute. Hook addresses are
+        # taken from the runtime scan, never hardcoded, so a different unpacked
+        # layout cannot point them at nothing without the scan saying so.
+        "HALF_LENGTH_VALUE_HOOKS_ENABLED", "fifa-halflength-value-beta2269",
+        # BETA 2.26.11. Half length is field index 5 in a registered table, so
+        # follow the registration rather than the name. The call target is
+        # derived from the site bytes, never hardcoded, and the table is *also*
+        # enumerated from the call sites so it does not depend on attaching
+        # before engine init (the tracer attaches ~15 s in, well after it).
+        "FIELD_REGISTRY_HOOK_ENABLED", "fifa-field-registry-beta2270",
+        "enumerateFieldRegistrations", "fifa-field-table-beta2270",
+        # BETA 2.26.12. fifa14.exe is packed, so its code can only be read by
+        # copying windows out of the running image. Disassemble them offline with
+        # scratchpad/disasm_dump.py.
+        "CODE_DUMP_TARGETS", "fifa-code-dump-beta2271", "dumpCodeWindows",
+        # BETA 2.26.14. The settings-array writer, found by interactive memory
+        # search: mov [ecx+eax*4+0x4384], edx at fifa14.exe+0x12241b8, half
+        # length is index 0. The signature is checked before attaching because
+        # the RVA came from a debugger session, not from our own scan.
+        "SETTINGS_WRITE_RVA", "fifa-settings-write-beta2272",
+        "HALF_LENGTH_SETTING_INDEX",
+        # BETA 2.26.16. Attaching mid-function at 0x12241b8 crashed the game the
+        # moment the tester opened Game Settings -- 24 bytes into a 33-byte
+        # function on the hot path of every settings write. The replacement
+        # attaches at the *entry*, captures the address once and detaches, then
+        # reads the slot with no hook at all. Keep the one-shot/detach shape.
+        "SETTINGS_FN_RVA", "fifa-settings-address-beta2273",
+        # BETA 2.26.19: the probe must stay attached. The setter only runs when a
+        # setting actually changes, so detaching after the first hit meant a
+        # session that never changed one never learned the address and the
+        # override silently did nothing (2026-08-18 22:25).
+        "reportHalfLength", "applyHalfLengthOverride", "restoreHalfLength",
+        "if (!FUT_GAMEPLAY_EVENT_HOOKS_ENABLED) return;",
         "GET_STADIUM_ID_WRAPPER_RVA", "STADIUM_PROVIDER_GLOBAL_RVA", "LOCAL_OFFLINE_STADIUM_ID",
         "cards-stadium-provider-get-beta222", "cards-stadium-provider-poll-beta222",
         "cards-match-bridge-enter-beta222", "cards-get-stadium-script-result-beta222", "mscdecl",
@@ -259,7 +342,13 @@ def main() -> int:
 
     expected = {
         158023: ("Lionel Messi", 94, "CF", 241, 53),
-        190871: ("Neymar", 84, "LW", 241, 53),
+        # DB FIFA 14 V3 community update, 18/08/2026, changes this deliberately:
+        # "Neymar 84 FC Barcelona (position corrected to ST / BU)". The retail
+        # card is LW; this expectation now tracks the merged community data, so
+        # it is no longer a retail-fidelity assertion for this one player. Every
+        # other row here is still retail. Revert to "LW" if the community
+        # position edit is ever dropped.
+        190871: ("Neymar", 84, "ST", 241, 53),
         20801: ("Cristiano Ronaldo", 92, "LW", 243, 53),
         41236: ("Zlatan Ibrahimović", 89, "ST", 73, 16),
         189505: ("Pedro", 85, "LW", 241, 53),

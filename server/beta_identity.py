@@ -245,6 +245,28 @@ SEASON_RELEGATION_THRESHOLDS = {
 # How long after the Seasons screen saves its state a new match still counts as
 # a season fixture. The captured gap is under a second (save, then kick off), so
 # this is only wide enough to survive a slow squad screen in between.
+DEFAULT_MATCH_LENGTH_MIN = 6
+
+
+def _match_length_min() -> int:
+    """Half length in minutes served to offline competitions.
+
+    CardsDLL builds a competition record from this JSON and then pushes
+    `record+0x50` into the gameplay parameters as `HALF_LENGTH`
+    (`CardsDLLzf 0x100d088d`, the same block that sets `AI_GROUP` from
+    `record+0x5c` and the `MULTIPLIER_*` fields). The client is observed parsing
+    `matchLengthMin` out of the season list -- JSON key id 293, parsed at
+    `CardsDLLzf+0x13ebd3`. §7.8's "gameplay ignores it" was established against
+    the *settings* `matchlength`, which is the menu label; this is a different
+    field on a different document and has never been tested on its own.
+    """
+    try:
+        value = int(load_local_settings().get("matchLengthMin", DEFAULT_MATCH_LENGTH_MIN))
+    except Exception:
+        return DEFAULT_MATCH_LENGTH_MIN
+    return value if 1 <= value <= 11 else DEFAULT_MATCH_LENGTH_MIN
+
+
 SEASON_MATCH_SAVE_WINDOW_SECONDS = 900
 
 # Tournament BETA 2.2 froze after a guessed record containing `rounds: 4`.
@@ -478,6 +500,19 @@ def _first_real_division() -> int:
     return max(real) if real else int(OFFLINE_SEASON_DIVISIONS[0][0])
 
 
+def _unplaced_alias_division() -> int:
+    """The division number a client that has never been placed uses for itself.
+
+    CardsDLL keeps its own offline division as a *tier index* and derives it as
+    ``11 - divisionId`` (`0x100623e5`, and again at `0x1006217f` for the
+    season/user record). A club that has never been placed has index 0, so the
+    only divisionId that resolves to it is 11 -- which is why `season/list` has
+    to carry a record under 11, and why the client addresses its own saves as
+    ``PUT /season/<id>/division/11/user``.
+    """
+    return _first_real_division() + 1
+
+
 def _season_ladder_id(division: int) -> int:
     """The 1-based season-list `id` that carries a division.
 
@@ -558,7 +593,7 @@ def _native_season_record(index: int, division: int, matches: int, promote: int,
         "type": "OFFLINE",
         "divisionId": int(division),
         "numMatches": int(matches),
-        "matchLengthMin": 6,
+        "matchLengthMin": _match_length_min(),
         "matches": _season_matches(int(division), int(matches)),
         "prizeSet": [
             _season_prize("RELEGATION", 0, 0),
@@ -613,7 +648,7 @@ def _native_tournament_record(definition: dict[str, Any]) -> dict[str, Any]:
         "elgReq": [],
         "numTeams": 16,
         "numRounds": len(rounds),
-        "matchlength": 6,
+        "matchlength": _match_length_min(),
         "rounds": rounds,
         "awardSet": {"awards": [{"awardType": 1, "value": int(definition.get("prize", 0) or 0), "halid": 0}]},
         "lock": "UNLOCKED",
@@ -647,7 +682,31 @@ def _utc_day(ts: int | None = None) -> str:
     return time.strftime("%Y-%m-%d", time.gmtime(int(ts if ts is not None else time.time())))
 
 
+# The wire key for the season/cup progress buffer. CardsDLL's JSON key table
+# carries "progressdata" (Impulsum14 reads it at index 395) and
+# "progressDataVersion" (396) but no camelCase "progressData"; the 2026-08-20
+# capture shows the camelCase key resolving to the miss id 614. The client
+# itself PUTs "progressData", so writers accept both and readers emit lowercase.
+_PROGRESS_DATA_WIRE_KEY = "progressdata"
+
+
+def _progress_data_from(document: dict[str, Any]) -> str:
+    """The progress buffer from a client write, whichever casing it used."""
+    for key in ("progressData", _PROGRESS_DATA_WIRE_KEY):
+        value = document.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
 class BetaIdentityStore(LocalIdentityStore):
+    # BETA 2.26.3. When the Seasons screen was last read. See
+    # _season_division_for_match: the pre-kickoff save it used to key off stopped
+    # happening once seasons actually resumed, so the screen *read* is the signal
+    # now. Class-level default: never let a fresh instance AttributeError here,
+    # and a restart simply means the next season read re-stamps it.
+    _season_screen_seen_at: float = 0.0
+
     """v2.41 local-play account/economy/match state layered on the stable FUT store.
 
     The BETA database is persistent across extracted builds. A truly fresh database
@@ -1272,9 +1331,24 @@ class BetaIdentityStore(LocalIdentityStore):
             if int(definition.get("trophyResourceId", 0) or 0) == resource_id:
                 tournament_id = int(definition.get("tournamentId", 0) or 0)
                 image_key = f"local_tournament_{tournament_id}"
+                # Impulsum14 answers the same URL with a trophy document whose name
+                # is carried inline as `locString: [{lang, label}]` beside an
+                # `assetName`/`silName` art pair (trophy_1100_gold for cup 1, four
+                # designs apart per cup). All five keys resolve in CardsDLLzf.dll's
+                # key table (checked 2026-09-05), so they ride alongside the
+                # StaticActiveTournamentNameInfo members below rather than
+                # replacing them. Whether the label reaches the screen is the
+                # open question in §7.6 / issue #8 -- one capture answers it.
+                design = 1100 + 4 * max(0, tournament_id - 1)
+                cup_name = str(definition.get("name") or f"Local Cup {tournament_id}")
                 # These names are taken from the exact StaticActiveTournamentNameInfo
                 # serializer key table (NAME/ID/IMAGEFILE_SMALL/LARGE).
                 return {
+                    "tournamentId": tournament_id,
+                    "tournamentType": 0,
+                    "assetName": f"trophy_{design}_gold",
+                    "silName": f"trophy_{design}_dark",
+                    "locString": [{"lang": "ENG_US", "label": cup_name}],
                     "ID": tournament_id,
                     # StaticActiveTournamentNameInfo resolves NAME through FUT localization.
                     # A literal name becomes the retail "*" missing-text marker.
@@ -3142,8 +3216,20 @@ class BetaIdentityStore(LocalIdentityStore):
         """The division of a season this match is being played inside, if any.
 
         Offline FUT only has two competitions. A cup match carries its
-        tournamentId in the create-match body, so the remaining signal for a
-        season match is the save the Seasons screen writes just before kickoff.
+        tournamentId in the create-match body, so the remaining signal is that
+        the Seasons screen was just open.
+
+        BETA 2.26.3: that used to be read from the save the screen wrote *before*
+        kickoff -- but that save only ever existed because the season was failing
+        to resume and the screen was starting fresh every time. Now that it
+        resumes (2.26.2) the screen writes nothing on open, only after a match,
+        and keying off it silently turned the tally into a race: a fixture counted
+        only if the *previous* one had ended within the window. The 2026-08-17
+        04:30 capture is that race -- four forfeits, two counted (04:30:43 at
+        858 s since the last save and 04:52:22 at 115 s) and two dropped (04:31:44
+        at 919 s, 04:50:11 at 1085 s) -- leaving the server on 3 fixtures while
+        the client had advanced to round 5. Take the later of the two stamps: the
+        screen *read*, which happens seconds before every kickoff, and the save.
         """
         document = document if isinstance(document, dict) else {}
         try:
@@ -3155,8 +3241,8 @@ class BetaIdentityStore(LocalIdentityStore):
         _div, _name, matches, _promote, _coins = _season_definition(int(row["division"]))
         if int(row["matches_played"]) >= int(matches):
             return None
-        saved_at = int(row["saved_at"] or 0)
-        if not saved_at or int(time.time()) - saved_at > SEASON_MATCH_SAVE_WINDOW_SECONDS:
+        seen_at = max(int(row["saved_at"] or 0), int(self._season_screen_seen_at or 0))
+        if not seen_at or int(time.time()) - seen_at > SEASON_MATCH_SAVE_WINDOW_SECONDS:
             return None
         return int(row["division"])
 
@@ -3317,6 +3403,17 @@ class BetaIdentityStore(LocalIdentityStore):
             return False
         return len(payload) <= 8 or payload[8] != 0
 
+    @staticmethod
+    def _season_has_history_locked(
+        connection: sqlite3.Connection, persona_id: int
+    ) -> bool:
+        """Has this club ever finished a season? Empty history means unplaced."""
+        row = connection.execute(
+            "SELECT 1 FROM beta_season_history WHERE persona_id=? LIMIT 1",
+            (int(persona_id),),
+        ).fetchone()
+        return row is not None
+
     def _season_user_document_locked(
         self, connection: sqlite3.Connection, persona_id: int
     ) -> dict[str, Any]:
@@ -3348,16 +3445,59 @@ class BetaIdentityStore(LocalIdentityStore):
             int(row["round_value"] or 1), str(row["season_data"] or "")
         )
         has_save = resumable and self.season_save_mode() == "blob"
+        # BETA 2.26.2. While the club has never been placed, report the division
+        # the *client* is using for itself, not the ladder tier we store it under.
+        #
+        # Reporting 10 to an unplaced client is why no season has ever resumed.
+        # The client derives a tier index as `11 - divisionId` and compares it
+        # against its own (0 while unplaced); 10 gives 1, so it decides the record
+        # belongs to some other division and starts a fresh season -- 2026-08-17
+        # 04:15 is the clean run: served `seasonId 1 / divisionId 10 / round 2`
+        # with a 576-byte 18-player save, the client read all seven members and
+        # then wrote `round 1` with the 20-byte stub. Its own value is not a guess:
+        # every save it has ever written went to `/season/1/division/11/user` while
+        # we were reporting 10, so it is not echoing us.
+        #
+        # BETA 2.26.18: this used to also require an empty `beta_season_history`,
+        # on the guess that finishing a season would place the club and change
+        # the client's own tier index. It does not. The 2026-08-18 22:09 capture
+        # caught the hole live -- the club had finished a season (history row: 10
+        # matches, 0 points, stayed in division 10), the alias stopped being
+        # reported, `season/user` went back to `divisionId 10`, and the client
+        # discarded the resume and restarted at round 1 exactly as it did before
+        # 2.26.2. The client settles it: *after* that completed season it still
+        # writes its saves to `/season/1/division/11/user`, so its index is still
+        # 0 and the alias still applies. Entry division plus a resumable save is
+        # the whole condition.
+        #
+        # This also settles the disagreement `offline_season_user`'s docstring
+        # describes without touching season/list: the list's id-1 record already
+        # carries divisionId 11, so seasonId 1 now names a record whose division
+        # matches. §5's "1 / 11 -> access violation at CardsDLLzf+0xc66dd" row is
+        # recorded as happening **when the data buffer was empty**, which
+        # `_season_progress_is_resumable` now prevents outright; that row does not
+        # cover this case. Once a club has real history the ladder division is
+        # reported as before -- whether the client adopts *that* is still §7.1.
+        reported_division = division
+        if has_save and division == _entry_season_division():
+            reported_division = _unplaced_alias_division()
         document: dict[str, Any] = {
             "seasonId": _season_ladder_id(division) if has_save else -1,
-            "divisionId": division,
+            "divisionId": reported_division,
             "round": max(1, min(int(matches), int(row["round_value"] or 1))),
         }
         if has_save:
             document["data"] = str(row["season_data"])
             document["dataVersion"] = max(1, int(row["data_version"] or 1))
             if str(row["progress_data"] or ""):
-                document["progressData"] = str(row["progress_data"])
+                # "progressdata", all lowercase. CardsDLL's key mapper resolved the
+                # camelCase key to id 614 in the 2026-08-20 capture -- the same id
+                # every invented key (wins, fifaPoints, badgeId ...) gets, i.e. a
+                # miss -- while progressDataVersion resolved to 396. The DLL's
+                # string table has an exact "progressdata" and no "progressData":
+                # the client writes one casing and reads the other. The buffer
+                # still precedes its version member (§5, buffer before version).
+                document[_PROGRESS_DATA_WIRE_KEY] = str(row["progress_data"])
                 document["progressDataVersion"] = max(1, int(row["progress_data_version"] or 1))
         return document
 
@@ -3430,6 +3570,10 @@ class BetaIdentityStore(LocalIdentityStore):
         with self._lock, closing(self._connect()) as connection, connection:
             persona_id = int(self._identity(connection)["persona_id"])
             self._finish_season_if_complete_locked(connection, persona_id)
+            # The Seasons screen fetches this on the way in, seconds before
+            # kickoff. Stamp it: it is what tells a later match it is a season
+            # fixture now that a resuming season writes nothing before kickoff.
+            self._season_screen_seen_at = float(time.time())
             return self._season_user_document_locked(connection, persona_id)
 
     def offline_season_load(self, season_id: int = 0, division: int = 0) -> dict[str, Any]:
@@ -3457,13 +3601,15 @@ class BetaIdentityStore(LocalIdentityStore):
 
         # Echoed in the client's own write order, which is the order its format
         # string builds: round, dataVersion, data, progressDataVersion,
-        # progressData. The cup update does the same.
+        # progressData -- except that the buffer goes back under the lowercase
+        # key the client's reader actually resolves (see _PROGRESS_DATA_WIRE_KEY).
+        # Both casings are accepted on the way in. The cup update does the same.
         payload = {
             "round": _positive("round"),
             "dataVersion": _positive("dataVersion"),
             "data": str(document.get("data") or ""),
             "progressDataVersion": _positive("progressDataVersion"),
-            "progressData": str(document.get("progressData") or ""),
+            _PROGRESS_DATA_WIRE_KEY: _progress_data_from(document),
         }
         with self._lock, closing(self._connect()) as connection, connection:
             persona_id = int(self._identity(connection)["persona_id"])
@@ -3512,6 +3658,38 @@ class BetaIdentityStore(LocalIdentityStore):
                     "lost=0 WHERE persona_id=?",
                     (persona_id,),
                 )
+            elif payload["round"] > 1:
+                # BETA 2.26.22, Impulsum14's Seasons.SaveProgress rule. The client
+                # owns the fixture list, so `round - 1` is how many fixtures are
+                # really behind it. Where our tally disagrees, ours is the wrong
+                # one: the 2026-08-17 04:30 capture left this row one fixture
+                # short (§7.1b) and every later save carried the truth. A
+                # shortfall is closed with losses -- we cannot know the results
+                # we missed, and over-crediting would hand out a promotion the
+                # player did not earn. A tally that ran ahead (a friendly counted
+                # as a fixture) is trimmed the same way.
+                client_played = max(0, min(int(matches), payload["round"] - 1))
+                tallied = int(row["matches_played"])
+                if client_played > tallied:
+                    missed = client_played - tallied
+                    connection.execute(
+                        "UPDATE beta_season_progress SET matches_played=?,lost=lost+? WHERE persona_id=?",
+                        (client_played, missed, persona_id),
+                    )
+                    _diagnostic(
+                        f"division {current_division} tally was {missed} fixture(s) behind the "
+                        f"client's round {payload['round']}; counted as losses (played={client_played})"
+                    )
+                elif client_played < tallied:
+                    over = tallied - client_played
+                    connection.execute(
+                        "UPDATE beta_season_progress SET matches_played=?,lost=MAX(0,lost-?) WHERE persona_id=?",
+                        (client_played, over, persona_id),
+                    )
+                    _diagnostic(
+                        f"division {current_division} tally was {over} fixture(s) ahead of the "
+                        f"client's round {payload['round']}; trimmed (played={client_played})"
+                    )
             now = int(time.time())
             connection.execute(
                 """UPDATE beta_season_progress SET round_value=?,data_version=?,season_data=?,
@@ -3522,7 +3700,7 @@ class BetaIdentityStore(LocalIdentityStore):
                     payload["dataVersion"],
                     payload["data"],
                     payload["progressDataVersion"],
-                    payload["progressData"],
+                    payload[_PROGRESS_DATA_WIRE_KEY],
                     now,
                     now,
                     persona_id,
@@ -3717,16 +3895,16 @@ class BetaIdentityStore(LocalIdentityStore):
             "dataVersion": max(1, int(document.get("dataVersion", 1) or 1)),
             "tournamentData": str(document.get("tournamentData") or ""),
             "progressDataVersion": max(1, int(document.get("progressDataVersion", 1) or 1)),
-            "progressData": str(document.get("progressData") or ""),
+            _PROGRESS_DATA_WIRE_KEY: _progress_data_from(document),
         }
         resumable = self._tournament_progress_is_resumable(
-            payload["round"], payload["tournamentData"], payload["progressData"]
+            payload["round"], payload["tournamentData"], payload[_PROGRESS_DATA_WIRE_KEY]
         )
         with self._lock, closing(self._connect()) as connection, connection:
             persona_id = int(self._identity(connection)["persona_id"])
             stored_round = payload["round"] if resumable else 1
             stored_tournament_data = payload["tournamentData"] if resumable else ""
-            stored_progress_data = payload["progressData"] if resumable else ""
+            stored_progress_data = payload[_PROGRESS_DATA_WIRE_KEY] if resumable else ""
             connection.execute(
                 """INSERT INTO beta_tournament_progress (
                     persona_id,tournament_id,round_value,data_version,tournament_data,
@@ -3763,7 +3941,7 @@ class BetaIdentityStore(LocalIdentityStore):
             return {
                 "tournamentId": tournament_id, "round": int(row["round_value"]),
                 "dataVersion": int(row["data_version"]), "tournamentData": row["tournament_data"],
-                "progressDataVersion": int(row["progress_data_version"]), "progressData": row["progress_data"],
+                "progressDataVersion": int(row["progress_data_version"]), _PROGRESS_DATA_WIRE_KEY: row["progress_data"],
             }
 
     def record_easfc_signal(self, command: int) -> dict[str, Any]:
